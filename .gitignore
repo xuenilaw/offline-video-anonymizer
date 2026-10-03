@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+
+# Recordings may contain faces, voices, names, and other personal data.
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+output/
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
