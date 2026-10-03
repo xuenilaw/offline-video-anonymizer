@@ -1,6 +1,6 @@
 # Offline video anonymization proof of concept
 
-This is an early, local Python proof of concept that pixelates detected faces and vehicle license plates in an MP4 video. It is **not yet a desktop application** and does not process voices or participant names separately.
+This is an early, local Python proof of concept that pixelates detected faces and vehicle license plates in an MP4 video. It is **not yet a desktop application** and does not process voices.
 
 ## Run locally
 
@@ -22,13 +22,21 @@ python main.py --input my_video.mp4 --video-type meeting --output output/meeting
 
 You can also run `python video_type.py my_video.mp4` to get the analysis as JSON. The `meeting` profile detects faces but skips license plates, preventing the plate detector from pixelating captions. The `dashcam` profile detects faces and plates; `normal` detects faces. These are current defaults, not final privacy decisions.
 
+For a recognized two-by-two meeting grid, the meeting profile also covers four expected participant-name areas with solid dark bars. This works for the tested Meet layout, but label positions vary among apps and window sizes. You can add a name mask using pixel coordinates from the original video; repeat the option for more labels:
+
+```bash
+python main.py --input my_video.mp4 --video-type meeting --name-region 160,320,240,25 --output output/review.mp4
+```
+
+Use `--no-auto-names` to disable the four inferred masks when they are misplaced. Review every frame for visible names and captions before sharing the result. The name masks are opaque because softened text can remain readable.
+
 ## Current limitations
 
 - Type detection uses conservative visual rules. Different meeting layouts, static dashcam footage, or mixed-content recordings may be classified as `unknown` or incorrectly; use `--video-type` after reviewing the video.
-- Participant names are not yet masked. The meeting profile preserves captions but still requires manual review before sharing.
+- Automatic participant-name masking only covers the recognized two-by-two grid. Other meeting layouts and labels outside those four zones need `--name-region` or a later desktop editing interface.
 - Detection can miss faces or plates; review the entire output before sharing it.
 - The source audio is unchanged and may identify speakers or contain personal information.
-- The script does not redact names, chat messages, browser tabs, location clues, or other identifiers.
+- The script does not automatically redact names outside the four recognized label zones, chat messages, browser tabs, location clues, or other identifiers.
 
 This repository contains no sample or processed recordings. Local video files and `output/` are excluded by `.gitignore` because they may contain personal data or material that cannot be redistributed.
 

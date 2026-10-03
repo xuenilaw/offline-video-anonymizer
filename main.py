@@ -9,6 +9,12 @@ import subprocess
 
 import cv2
 from imageio_ffmpeg import get_ffmpeg_exe
+from meeting_names import (
+    is_standard_two_by_two,
+    parse_region,
+    redact_regions,
+    standard_two_by_two_regions,
+)
 from video_type import analyze_video, looks_like_road_plate
 
 
@@ -125,6 +131,10 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
     parser.add_argument("--video-type", choices=("auto", "meeting", "dashcam", "normal"), default="auto")
     parser.add_argument("--analyze-only", action="store_true", help="Print the type suggestion without processing")
+    parser.add_argument("--name-region", type=parse_region, action="append", default=[],
+                        metavar="X,Y,WIDTH,HEIGHT", help="Cover an additional name region in pixel coordinates; repeat as needed")
+    parser.add_argument("--no-auto-names", action="store_true",
+                        help="Disable standard two-by-two meeting label masks")
     args = parser.parse_args(argv)
 
     if not args.input.exists():
@@ -162,6 +172,23 @@ def main(argv=None):
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    for x, y, _, _ in args.name_region:
+        if x >= width or y >= height:
+            capture.release()
+            parser.error(f"Name region origin ({x},{y}) is outside the {width}x{height} video")
+
+    name_regions = list(args.name_region)
+    if video_type == "meeting" and not args.no_auto_names:
+        if analysis is None:
+            analysis = analyze_video(args.input)
+        if is_standard_two_by_two(analysis):
+            name_regions.extend(standard_two_by_two_regions(width, height))
+            print("Using four standard meeting label masks; review all names and captions in the output.")
+        else:
+            print("Standard meeting layout not recognized; add --name-region for each visible label.")
+    if video_type == "meeting" and not name_regions:
+        print("Warning: no participant name regions are masked.")
+
     face_detector = cv2.FaceDetectorYN.create(
         str(FACE_MODEL_PATH),
         "",
@@ -219,6 +246,8 @@ def main(argv=None):
                     pad_x_ratio=pad_x,
                     pad_y_ratio=pad_y,
                 )
+
+            redact_regions(frame, name_regions)
 
             writer.write(frame)
             processed += 1
