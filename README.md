@@ -6,14 +6,26 @@ This is an early, local Python proof of concept that pixelates detected faces an
 
 1. Install Python and create a virtual environment.
 2. Install dependencies with `pip install -r requirements.txt`.
-3. Put a video you are authorized to process at `test_video.mp4` in this directory.
+3. Put a video you are authorized to process at `test_video.mp4` in this directory, or pass its path with `--input`.
 4. Run `python main.py`.
 
-The result is written to `output/blurred_faces_and_plates.mp4`. The current script uses fixed paths in `main.py` and copies the source audio into the output. If audio remuxing fails, it produces a video without audio and prints a warning.
+The result is written to `output/blurred_faces_and_plates.mp4` unless you pass `--output`. The script copies the source audio into the output. If audio remuxing fails, it produces a video without audio and prints a warning.
+
+## Video type suggestion
+
+`main.py` now samples up to seven frames before processing and suggests `meeting`, `dashcam`, or `normal`. It prints a confidence **evidence score**, not a calibrated probability. If the result is `unknown`, processing stops until you choose a type. The suggestion can be wrong, so review it and the final video.
+
+```bash
+python main.py --input my_video.mp4 --analyze-only
+python main.py --input my_video.mp4 --video-type meeting --output output/meeting.mp4
+```
+
+You can also run `python video_type.py my_video.mp4` to get the analysis as JSON. The `meeting` profile detects faces but skips license plates, preventing the plate detector from pixelating captions. The `dashcam` profile detects faces and plates; `normal` detects faces. These are current defaults, not final privacy decisions.
 
 ## Current limitations
 
-- The plate detector runs on every frame. In screen recordings, it can mistake captions and other interface text for license plates and pixelate them.
+- Type detection uses conservative visual rules. Different meeting layouts, static dashcam footage, or mixed-content recordings may be classified as `unknown` or incorrectly; use `--video-type` after reviewing the video.
+- Participant names are not yet masked. The meeting profile preserves captions but still requires manual review before sharing.
 - Detection can miss faces or plates; review the entire output before sharing it.
 - The source audio is unchanged and may identify speakers or contain personal information.
 - The script does not redact names, chat messages, browser tabs, location clues, or other identifiers.
