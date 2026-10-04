@@ -1,11 +1,14 @@
 """Small offline desktop front end for the video anonymizer."""
 
 import json
+from copy import deepcopy
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
+import time
 
 try:
     import tkinter as tk
@@ -18,10 +21,13 @@ except ImportError as error:
 
 from video_preview import VideoPreview
 from video_type import analyze_video
+from region_editor import edit_regions
+import cv2
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
+FRAME_PROGRESS = re.compile(r"Processed (\d+)/(\d+) frames")
 TYPE_LABELS = {
     "Let the app suggest": "auto",
     "Online meeting": "meeting",
@@ -43,6 +49,50 @@ def unique_destination(source, output_folder, reserved):
         counter += 1
 
 
+def video_frame_count(path):
+    capture = cv2.VideoCapture(str(path))
+    try:
+        return max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    finally:
+        capture.release()
+
+
+def format_remaining(seconds):
+    seconds = max(0, round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+class ProgressEstimator:
+    """Estimate batch progress from decoded frames and observed wall time."""
+
+    def __init__(self, frame_counts):
+        self.total = max(1, sum(frame_counts))
+        self.finished = 0
+        self.started = time.monotonic()
+
+    def snapshot(self, current=0, *, finalizing=False):
+        done = min(self.total, self.finished + current)
+        percent = min(99, round(100 * done / self.total))
+        elapsed = time.monotonic() - self.started
+        if finalizing:
+            remaining = "Finishing audio and saving; time may vary"
+        elif done >= 24 and elapsed >= 1:
+            estimate = elapsed * (self.total - done) / done
+            remaining = f"About {format_remaining(estimate)} remaining"
+        else:
+            remaining = "Estimating remaining time…"
+        return percent, remaining
+
+    def finish_file(self, frame_count):
+        self.finished = min(self.total, self.finished + frame_count)
+
+
 class AnonymizerApp:
     def __init__(self, root):
         self.root = root
@@ -53,7 +103,9 @@ class AnonymizerApp:
         self.running = False
         self.analysis = None
         self.results = []
+        self.result_configs = []
         self.result_index = -1
+        self.manual_regions = {}
         self.input_mode = tk.StringVar(value="video")
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
@@ -62,13 +114,16 @@ class AnonymizerApp:
         self.faces = tk.BooleanVar(value=True)
         self.plates = tk.BooleanVar(value=False)
         self.names = tk.BooleanVar(value=False)
-        self.name_regions = tk.StringVar()
         self.audio_mode = tk.StringVar(value="keep")
         self.pitch = tk.StringVar(value="-4")
         self.suggestion = tk.StringVar(value="Select a video, then analyze it locally.")
         self.mask_summary = tk.StringVar()
         self.progress = tk.StringVar()
+        self.meter_value = tk.DoubleVar(value=0)
+        self.meter_percent = tk.StringVar(value="0%")
+        self.remaining_time = tk.StringVar(value="Waiting to start")
         self.result_position = tk.StringVar(value="No results yet")
+        self.manual_summary = tk.StringVar(value="No drawn areas for this video yet.")
 
         container = ttk.Frame(root, padding=18)
         container.pack(fill="both", expand=True)
@@ -102,10 +157,12 @@ class AnonymizerApp:
         files = ttk.LabelFrame(left, text="1  Choose video or folder", padding=12)
         files.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         files.columnconfigure(1, weight=1)
-        ttk.Radiobutton(files, text="One video", variable=self.input_mode, value="video",
-                        command=self._mode_changed).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(files, text="Folder of videos", variable=self.input_mode, value="folder",
-                        command=self._mode_changed).grid(row=0, column=1, sticky="w")
+        self.mode_buttons = []
+        for column, (label, value) in enumerate((("One video", "video"), ("Folder of videos", "folder"))):
+            button = ttk.Radiobutton(files, text=label, variable=self.input_mode, value=value,
+                                     command=self._mode_changed)
+            button.grid(row=0, column=column, sticky="w")
+            self.mode_buttons.append(button)
         self.input_label = self._file_row(files, 1, "Video to anonymize", self.input_path, self._browse_input)
         self.output_label = self._file_row(files, 2, "Save result as", self.output_path, self._browse_output)
 
@@ -146,16 +203,12 @@ class AnonymizerApp:
         ttk.Label(masks, textvariable=self.mask_summary, wraplength=550).grid(
             row=6, column=0, sticky="w", pady=(4, 6)
         )
-        ttk.Button(masks, text="Advanced: add name areas", command=self._toggle_advanced).grid(
-            row=7, column=0, sticky="w"
+        ttk.Button(masks, text="Draw cover / blur / keep-clear areas…", command=self._edit_areas).grid(
+            row=7, column=0, sticky="w", pady=(10, 0)
         )
-        self.advanced = ttk.Frame(masks)
-        self.advanced.grid(row=8, column=0, sticky="ew", pady=(7, 0))
-        self.advanced.columnconfigure(0, weight=1)
-        ttk.Label(self.advanced, text="Extra name areas: x,y,width,height; separate areas with semicolons.",
-                  wraplength=530).grid(row=0, column=0, sticky="w")
-        ttk.Entry(self.advanced, textvariable=self.name_regions).grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        self.advanced.grid_remove()
+        ttk.Label(masks, textvariable=self.manual_summary, wraplength=530).grid(
+            row=8, column=0, sticky="w", pady=(4, 0)
+        )
 
         audio = ttk.LabelFrame(left, text="4  What should happen to the sound?", padding=12)
         audio.grid(row=3, column=0, sticky="ew", pady=(0, 10))
@@ -191,19 +244,23 @@ class AnonymizerApp:
         self.next_button = ttk.Button(navigation, text="Next ›", command=lambda: self._show_result(1),
                                        state="disabled")
         self.next_button.pack(side="right")
+        self.reprocess_button = ttk.Button(right, text="Reprocess selected video with drawn areas",
+                                            command=self._reprocess_selected, state="disabled")
+        self.reprocess_button.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         details = ttk.LabelFrame(right, text="Processing details", padding=8)
-        details.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        details.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        meter_labels = ttk.Frame(details)
+        meter_labels.pack(fill="x", pady=(0, 4))
+        ttk.Label(meter_labels, text="Overall progress").pack(side="left")
+        ttk.Label(meter_labels, textvariable=self.meter_percent).pack(side="right")
+        ttk.Progressbar(details, maximum=100, variable=self.meter_value,
+                        mode="determinate").pack(fill="x")
+        ttk.Label(details, textvariable=self.remaining_time).pack(anchor="w", pady=(4, 8))
         self.log = tk.Text(details, height=7, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True)
         self._mask_changed()
         root.protocol("WM_DELETE_WINDOW", self._close)
         root.after(100, self._drain_events)
-
-    def _toggle_advanced(self):
-        if self.advanced.winfo_ismapped():
-            self.advanced.grid_remove()
-        else:
-            self.advanced.grid()
 
     def _mask_changed(self):
         selected = [label for label, variable in (("faces", self.faces), ("plates", self.plates),
@@ -211,10 +268,53 @@ class AnonymizerApp:
         fallback = (self.input_mode.get() == "folder" and self.video_type.get() == "Let the app suggest"
                     and self.auto_batch.get())
         prefix = "Fallback for uncertain videos: " if fallback else "Selected for processing: "
-        self.mask_summary.set(prefix + (", ".join(selected) if selected else "nothing — choose at least one"))
+        self.mask_summary.set(prefix + (", ".join(selected) if selected else "none; draw a solid or blur box below"))
 
     def _audio_changed(self):
         self.pitch_entry.configure(state="normal" if self.audio_mode.get() == "alter" else "disabled")
+
+    def _editing_source(self):
+        if self.input_mode.get() == "folder":
+            if self.result_index < 0:
+                raise ValueError("Process the folder, then select a result to correct.")
+            return self.result_configs[self.result_index][0]
+        source = Path(self.input_path.get())
+        if not source.is_file():
+            raise ValueError("Select an input video first.")
+        return source.resolve()
+
+    def _update_manual_summary(self, source=None):
+        if source is None:
+            try:
+                source = self._editing_source()
+            except ValueError:
+                self.manual_summary.set("No drawn areas for this video yet.")
+                self.reprocess_button.configure(state="disabled")
+                return
+        areas = self.manual_regions.get(source.resolve(), {})
+        self.manual_summary.set(
+            f"Drawn areas for {source.name}: {len(areas.get('hide', []))} solid, "
+            f"{len(areas.get('blur', []))} blur, {len(areas.get('keep', []))} keep-clear. "
+            "Each uses its selected time range."
+        )
+        self.reprocess_button.configure(state="normal" if self.result_index >= 0
+                                        and any(areas.get(kind) for kind in ("hide", "blur", "keep"))
+                                        and not self.running
+                                        else "disabled")
+
+    def _edit_areas(self):
+        if self.running:
+            messagebox.showinfo("Processing", "Wait for processing to finish before editing areas.")
+            return
+        try:
+            source = self._editing_source()
+            revised = edit_regions(self.root, source, self.manual_regions.get(source))
+        except ValueError as error:
+            messagebox.showerror("Choose a video", str(error))
+            return
+        if revised is not None:
+            self.manual_regions[source] = revised
+            self._update_manual_summary(source)
 
     def _close(self):
         if self.running:
@@ -235,6 +335,7 @@ class AnonymizerApp:
         self.input_path.set("")
         self.output_path.set("")
         self.analysis = None
+        self._reset_results()
         self.input_label.configure(text="Folder to anonymize" if folder else "Video to anonymize")
         self.output_label.configure(text="Save results in" if folder else "Save result as")
         self.run_button.configure(text="Create anonymized videos" if folder else "Create anonymized video")
@@ -246,6 +347,7 @@ class AnonymizerApp:
             self.batch_checkbox.grid_remove()
             self.suggestion.set("Select a video, then analyze it locally.")
         self._type_changed()
+        self._update_manual_summary()
 
     def _videos_in_folder(self, folder):
         return sorted((path for path in folder.iterdir()
@@ -253,6 +355,8 @@ class AnonymizerApp:
                       key=lambda path: path.name.lower())
 
     def _browse_input(self):
+        if self.running:
+            return
         if self.input_mode.get() == "folder":
             selected = filedialog.askdirectory(title="Choose a folder of videos")
         else:
@@ -260,6 +364,7 @@ class AnonymizerApp:
         if selected:
             self.input_path.set(selected)
             self.analysis = None
+            self._reset_results()
             if self.input_mode.get() == "folder":
                 self.output_path.set(str(Path(selected) / "anonymized"))
                 count = len(self._videos_in_folder(Path(selected)))
@@ -268,8 +373,11 @@ class AnonymizerApp:
                 self.output_path.set(str(PROJECT_DIR / "output" / f"{Path(selected).stem}_anonymized.mp4"))
                 self.suggestion.set("Checking a few frames locally…")
                 self._analyze()
+            self._update_manual_summary()
 
     def _browse_output(self):
+        if self.running:
+            return
         if self.input_mode.get() == "folder":
             selected = filedialog.askdirectory(title="Choose an output folder")
         else:
@@ -293,6 +401,8 @@ class AnonymizerApp:
         self.running = True
         self.run_button.configure(state="disabled")
         self.analyze_button.configure(state="disabled")
+        for button in self.mode_buttons:
+            button.configure(state="disabled")
         threading.Thread(target=worker, daemon=True).start()
 
     def _analyze(self):
@@ -340,9 +450,9 @@ class AnonymizerApp:
         if not folder and destination.exists() and destination.is_dir():
             raise ValueError("The output location must be an MP4 file.")
         if not any((self.faces.get(), self.plates.get(), self.names.get())):
-            raise ValueError("Select at least one item to hide.")
-        if self.name_regions.get().strip() and not self.names.get():
-            raise ValueError("Select Participant names to use extra name rectangles.")
+            if not all(any(self.manual_regions.get(path.resolve(), {}).get(kind)
+                           for kind in ("hide", "blur")) for path in sources):
+                raise ValueError("Select an item to hide or draw a solid/blur area for every video.")
         pitch = -4
         if self.audio_mode.get() == "alter":
             try:
@@ -351,14 +461,6 @@ class AnonymizerApp:
                 raise ValueError("Enter a whole number for the pitch shift.") from error
             if pitch == 0 or not -6 <= pitch <= 6:
                 raise ValueError("Pitch must be -6 to -1 or 1 to 6 semitones.")
-        regions = []
-        for rectangle in self.name_regions.get().split(";"):
-            if rectangle.strip():
-                parts = rectangle.strip().split(",")
-                if (len(parts) != 4 or any(not part.strip().isdigit() for part in parts)
-                        or any(int(part) <= 0 for part in parts[2:])):
-                    raise ValueError("Name rectangles must use x,y,width,height in pixels.")
-                regions.append(rectangle.strip())
         return {
             "folder": folder,
             "sources": sources,
@@ -368,21 +470,40 @@ class AnonymizerApp:
             "masks": (self.faces.get(), self.plates.get(), self.names.get()),
             "audio_mode": self.audio_mode.get(),
             "pitch": pitch,
-            "regions": regions,
+            "manual_regions": deepcopy(self.manual_regions),
         }
 
     def _command(self, source, destination, settings, video_type, masks):
         faces, plates, names = masks
+        manual = settings["manual_regions"].get(source.resolve(), {})
+        if manual.get("keep") and not faces:
+            raise ValueError(f"Face masking must be selected to keep a face area clear: {source.name}")
         command = [sys.executable, "-u", str(PROJECT_DIR / "main.py"), "--input", str(source),
                    "--output", str(destination), "--video-type", video_type,
                    "--faces" if faces else "--no-faces",
                    "--plates" if plates else "--no-plates",
                    "--names" if names else "--no-names",
                    "--audio-mode", settings["audio_mode"], "--pitch-semitones", str(settings["pitch"])]
-        if names:
-            for rectangle in settings["regions"]:
-                command.extend(("--name-region", rectangle))
+        for region in manual.get("hide", []):
+            command.extend(("--hide-region", ",".join(map(str, region))))
+        for region in manual.get("blur", []):
+            command.extend(("--blur-region", ",".join(map(str, region))))
+        for region in manual.get("keep", []):
+            command.extend(("--keep-face-region", ",".join(map(str, region))))
         return command
+
+    def _run_command_with_progress(self, command, estimator, frame_count):
+        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in process.stdout:
+            self.events.put(("log", line))
+            match = FRAME_PROGRESS.fullmatch(line.strip())
+            if match:
+                processed, reported_total = map(int, match.groups())
+                self.events.put(("meter", estimator.snapshot(
+                    min(processed, frame_count), finalizing=processed >= reported_total
+                )))
+        return process.wait()
 
     def _process(self):
         try:
@@ -390,10 +511,7 @@ class AnonymizerApp:
         except ValueError as error:
             messagebox.showerror("Check settings", str(error))
             return
-        self.results = []
-        self.result_index = -1
-        self._update_result_navigation()
-        self.preview.clear()
+        self._reset_results()
         total = len(settings["sources"])
         self.progress.set(f"Processing {total} video(s) locally…")
         self._log(f"Starting {total} video(s).\n")
@@ -403,11 +521,17 @@ class AnonymizerApp:
             failed = 0
             reserved = set()
             try:
+                self.events.put(("meter", (0, "Reading video lengths…")))
+                frame_counts = [video_frame_count(source) for source in settings["sources"]]
+                estimator = ProgressEstimator(frame_counts)
+                self.events.put(("meter", estimator.snapshot()))
                 for index, source in enumerate(settings["sources"], 1):
+                    frame_count = frame_counts[index - 1]
                     destination = (unique_destination(source, settings["destination"], reserved)
                                    if settings["folder"] else settings["destination"])
                     self.events.put(("progress", f"Processing {index} of {total}: {source.name}"))
                     self.events.put(("log", f"\n[{index}/{total}] {source.name}\n"))
+                    self.events.put(("meter", estimator.snapshot()))
                     try:
                         video_type = settings["video_type"]
                         masks = settings["masks"]
@@ -422,22 +546,61 @@ class AnonymizerApp:
                             self.events.put(("log", f"Suggested type: {analysis.video_type}; "
                                                     f"masks: faces={masks[0]}, plates={masks[1]}, names={masks[2]}\n"))
                         command = self._command(source, destination, settings, video_type, masks)
-                        process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
-                        for line in process.stdout:
-                            self.events.put(("log", line))
-                        if process.wait() != 0:
+                        if self._run_command_with_progress(command, estimator, frame_count) != 0:
                             failed += 1
                             self.events.put(("log", f"Failed: {source.name}. See the error above.\n"))
                         else:
                             completed += 1
-                            self.events.put(("file_completed", destination.resolve()))
+                            self.events.put(("file_completed", (
+                                destination.resolve(), source.resolve(), settings, video_type, masks, False
+                            )))
                     except (OSError, ValueError, RuntimeError) as error:
                         failed += 1
                         self.events.put(("log", f"Failed: {source.name}: {error}\n"))
+                    estimator.finish_file(frame_count)
+                    self.events.put(("meter", estimator.snapshot()))
                 self.events.put(("batch_completed", (completed, failed)))
             except OSError as error:
                 self.events.put(("error", str(error)))
+            finally:
+                self.events.put(("done", None))
+
+        self._start(worker)
+
+    def _reprocess_selected(self):
+        if self.running or self.result_index < 0:
+            return
+        source, previous_settings, video_type, masks = self.result_configs[self.result_index]
+        areas = self.manual_regions.get(source, {})
+        if not any(areas.get(kind) for kind in ("hide", "blur", "keep")):
+            messagebox.showinfo("No corrections", "Draw a cover or keep-clear area first.")
+            return
+        settings = deepcopy(previous_settings)
+        settings["manual_regions"][source] = deepcopy(areas)
+        destination = unique_destination(source, self.results[self.result_index].parent, set())
+        self.progress.set(f"Reprocessing {source.name}…")
+        self.meter_value.set(0)
+        self.meter_percent.set("0%")
+        self.remaining_time.set("Estimating remaining time…")
+        self._log(f"\nReprocessing {source.name} with drawn areas.\n")
+
+        def worker():
+            try:
+                self.events.put(("meter", (0, "Reading video length…")))
+                frame_count = video_frame_count(source)
+                estimator = ProgressEstimator([frame_count])
+                self.events.put(("meter", estimator.snapshot()))
+                command = self._command(source, destination, settings, video_type, masks)
+                if self._run_command_with_progress(command, estimator, frame_count) == 0:
+                    self.events.put(("file_completed", (
+                        destination.resolve(), source, settings, video_type, masks, True
+                    )))
+                    self.events.put(("batch_completed", (1, 0)))
+                else:
+                    self.events.put(("batch_completed", (0, 1)))
+            except (OSError, ValueError) as error:
+                self.events.put(("log", f"Reprocessing failed: {error}\n"))
+                self.events.put(("batch_completed", (0, 1)))
             finally:
                 self.events.put(("done", None))
 
@@ -449,6 +612,17 @@ class AnonymizerApp:
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _reset_results(self):
+        self.results = []
+        self.result_configs = []
+        self.result_index = -1
+        self._update_result_navigation()
+        self.preview.clear()
+        self.progress.set("")
+        self.meter_value.set(0)
+        self.meter_percent.set("0%")
+        self.remaining_time.set("Waiting to start")
+
     def _update_result_navigation(self):
         count = len(self.results)
         if self.result_index < 0:
@@ -459,6 +633,7 @@ class AnonymizerApp:
         self.previous_button.configure(state="normal" if self.result_index > 0 else "disabled")
         self.next_button.configure(state="normal" if self.result_index >= 0
                                    and self.result_index < count - 1 else "disabled")
+        self._update_manual_summary()
 
     def _show_result(self, direction):
         target = self.result_index + direction
@@ -490,25 +665,38 @@ class AnonymizerApp:
                     self._log(payload)
                 elif kind == "progress":
                     self.progress.set(payload)
+                elif kind == "meter":
+                    percent, remaining = payload
+                    self.meter_value.set(percent)
+                    self.meter_percent.set(f"{percent}%")
+                    self.remaining_time.set(remaining)
                 elif kind == "error":
                     self.suggestion.set("Analysis failed. Check the error and choose a type manually.")
                     messagebox.showerror("Analysis failed", payload)
                 elif kind == "file_completed":
-                    self.results.append(payload)
-                    if self.result_index == -1:
-                        self._show_result(1)
+                    destination, source, settings, video_type, masks, focus = payload
+                    self.results.append(destination)
+                    self.result_configs.append((source, settings, video_type, masks))
+                    if self.result_index == -1 or focus:
+                        self._show_result(len(self.results) - 1 - self.result_index)
                     else:
                         self._update_result_navigation()
                 elif kind == "batch_completed":
                     completed, failed = payload
+                    self.meter_value.set(100)
+                    self.meter_percent.set("100%")
+                    self.remaining_time.set("Finished" if failed == 0 else f"Finished with {failed} failed video(s)")
                     self.progress.set(f"Finished: {completed} succeeded, {failed} failed. "
                                       "Use ‹ and › to review each result.")
                     self._log(f"\nFinished: {completed} succeeded, {failed} failed.\n")
                 elif kind == "done":
                     self.running = False
                     self.run_button.configure(state="normal")
+                    for button in self.mode_buttons:
+                        button.configure(state="normal")
                     self.analyze_button.configure(state="disabled" if self.input_mode.get() == "folder"
                                                   else "normal")
+                    self._update_manual_summary()
         except queue.Empty:
             pass
         self.root.after(100, self._drain_events)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 from audio_processing import finish_video
+from manual_regions import parse_timed_region, region_active
 from meeting_names import (
     is_standard_two_by_two,
     parse_region,
@@ -100,6 +101,25 @@ def pixelate(frame, box, pad_x_ratio=0.15, pad_y_ratio=0.30):
     )
 
 
+def clipped_region(box, width, height):
+    x, y, box_width, box_height = box[:4]
+    return x, y, min(width, x + box_width), min(height, y + box_height)
+
+
+def blur_region(frame, box):
+    """Strongly soften a manually selected region without a hard fill."""
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = clipped_region(box, width, height)
+    region = frame[y1:y2, x1:x2]
+    if region.size == 0:
+        return
+    small = cv2.resize(region, (max(1, (x2 - x1) // 18),
+                                max(1, (y2 - y1) // 18)), interpolation=cv2.INTER_AREA)
+    softened = cv2.resize(small, (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
+    sigma = max(3.0, min(x2 - x1, y2 - y1) * 0.08)
+    frame[y1:y2, x1:x2] = cv2.GaussianBlur(softened, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=INPUT_PATH)
@@ -114,6 +134,12 @@ def main(argv=None):
                         help="Mask meeting names (default: on only for meeting)")
     parser.add_argument("--name-region", type=parse_region, action="append", default=[],
                         metavar="X,Y,WIDTH,HEIGHT", help="Cover an additional name region in pixel coordinates; repeat as needed")
+    parser.add_argument("--hide-region", type=parse_timed_region, action="append", default=[],
+                        metavar="X,Y,W,H[,START,END]", help="Cover a missed detail during an optional time range in seconds; repeat as needed")
+    parser.add_argument("--blur-region", type=parse_timed_region, action="append", default=[],
+                        metavar="X,Y,W,H[,START,END]", help="Strongly blur a selected area during an optional time range; repeat as needed")
+    parser.add_argument("--keep-face-region", type=parse_timed_region, action="append", default=[],
+                        metavar="X,Y,W,H[,START,END]", help="Leave face masking clear in this area during an optional time range; repeat as needed")
     parser.add_argument("--no-auto-names", action="store_true",
                         help="Disable standard two-by-two meeting label masks")
     parser.add_argument("--audio-mode", choices=("keep", "mute", "alter"), default="keep",
@@ -141,8 +167,10 @@ def main(argv=None):
     mask_faces = True if args.faces is None else args.faces
     mask_plates = (video_type == "dashcam") if args.plates is None else args.plates
     mask_names = (video_type == "meeting") if args.names is None else args.names
-    if not (mask_faces or mask_plates or mask_names):
+    if not (mask_faces or mask_plates or mask_names or args.hide_region or args.blur_region):
         parser.error("Select at least one visual identifier to mask")
+    if args.keep_face_region and not mask_faces:
+        parser.error("--keep-face-region requires face masking to be selected")
     if not mask_names and args.name_region:
         parser.error("--name-region requires --names")
     if args.input.resolve() == args.output.resolve():
@@ -167,10 +195,11 @@ def main(argv=None):
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    for x, y, _, _ in args.name_region:
+    for region in args.name_region + args.hide_region + args.blur_region + args.keep_face_region:
+        x, y = region[:2]
         if x >= width or y >= height:
             capture.release()
-            parser.error(f"Name region origin ({x},{y}) is outside the {width}x{height} video")
+            parser.error(f"Region origin ({x},{y}) is outside the {width}x{height} video")
 
     name_regions = list(args.name_region) if mask_names else []
     if mask_names and video_type == "meeting" and not args.no_auto_names:
@@ -181,9 +210,11 @@ def main(argv=None):
             print("Using four standard meeting label masks; review all names and captions in the output.")
         else:
             print("Standard meeting layout not recognized; add --name-region for each visible label.")
-    if mask_names and not name_regions:
+    if mask_names and not name_regions and not (args.hide_region or args.blur_region):
         capture.release()
-        parser.error("Names were selected, but no name regions are available. Add --name-region or deselect names.")
+        parser.error("Names were selected, but no name regions are available. Draw a cover area, add --name-region, or deselect names.")
+    if mask_names and not name_regions and (args.hide_region or args.blur_region):
+        print("No automatic name areas were found; review that the manually covered areas include every visible name.")
 
     face_detector = None
     if mask_faces:
@@ -200,6 +231,8 @@ def main(argv=None):
 
     print(f"Profile: {video_type}; input: {width}x{height}, {fps:.3f} FPS, {frame_count} frames")
     print(f"Visual masks: faces={mask_faces}, plates={mask_plates}, names={mask_names}")
+    print(f"Manual regions: opaque={len(args.hide_region)}, blur={len(args.blur_region)}, "
+          f"keep faces clear={len(args.keep_face_region)}")
     if mask_plates and video_type != "dashcam":
         print("Warning: plate detection outside dashcam footage may mask captions or other text.")
     print(f"Audio mode: {args.audio_mode}")
@@ -210,6 +243,7 @@ def main(argv=None):
     plate_tracks = []
     face_tracks = []
     processed = 0
+    progress_interval = max(1, round(fps))
 
     try:
         while True:
@@ -236,8 +270,16 @@ def main(argv=None):
                     if looks_like_road_plate(frame, box)
                 ]
                 update_tracks(plate_tracks, detections)
-                for track in plate_tracks:
-                    pixelate(frame, track["box"])
+
+            # Save keep-clear areas before masking faces. Later plate and manual
+            # masks still cover these areas if they overlap.
+            clear_patches = []
+            seconds = processed / fps
+            for region in args.keep_face_region:
+                if not region_active(region, seconds):
+                    continue
+                x1, y1, x2, y2 = clipped_region(region, width, height)
+                clear_patches.append((x1, y1, x2, y2, frame[y1:y2, x1:x2].copy()))
 
             for track in face_tracks:
                 pad_x, pad_y = (0.15, 0.10) if video_type == "meeting" else (0.35, 0.40)
@@ -248,11 +290,22 @@ def main(argv=None):
                     pad_y_ratio=pad_y,
                 )
 
+            for x1, y1, x2, y2, original in clear_patches:
+                frame[y1:y2, x1:x2] = original
+
+            for track in plate_tracks:
+                pixelate(frame, track["box"])
+
+            for region in args.blur_region:
+                if region_active(region, seconds):
+                    blur_region(frame, region)
             redact_regions(frame, name_regions)
+            redact_regions(frame, [region[:4] for region in args.hide_region
+                                   if region_active(region, seconds)])
 
             writer.write(frame)
             processed += 1
-            if processed % 24 == 0 or processed == frame_count:
+            if processed % progress_interval == 0 or processed == frame_count:
                 print(f"Processed {processed}/{frame_count} frames")
     finally:
         capture.release()

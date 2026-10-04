@@ -16,7 +16,15 @@ For a folder, select the source folder and a separate output folder. The app pro
 
 Finished videos appear in the preview on the right. Use **‹ Previous** and **Next ›** to switch results, **Play** to review a result in the app, or **Open full video** to use your usual player. On macOS, the in-app preview also plays sound when the output has an audio track. The preview prepares a temporary local MP3 for sound and deletes it when the app closes. On other systems, use **Open full video** to check sound.
 
-Extra name rectangles are under **Advanced: add name areas**. Enter `x,y,width,height` in source-video pixels, separating multiple rectangles with semicolons. Automatic name rectangles currently cover only the recognized two-by-two meeting layout. The interface runs the existing Python processing scripts locally; it does not upload video. This is a source-code desktop prototype, not a packaged installer yet.
+**Processing details** shows an overall progress bar, percentage, and approximate remaining time for single videos and folders. The estimate is based on completed frames and observed processing speed; it becomes more useful after processing starts. Audio finishing can take additional time, so that stage is shown separately before the bar reaches 100%.
+
+Automatic name rectangles currently cover only the recognized two-by-two meeting layout. For other layouts, use **Draw cover / blur / keep-clear areas…** to cover the visible names. The interface runs the existing Python processing scripts locally; it does not upload video. This is a source-code desktop prototype, not a packaged installer yet.
+
+### Correct missed areas by hand
+
+Select a video and click **Draw cover / blur / keep-clear areas…**. In the source-video window, set **From** and **To** in seconds, or use the slider and **Start at this frame** / **End after this frame**, then draw a box. You can also select an existing box and click **Apply From/To to selected box**. Choose **Solid dark cover** for an opaque mask, **Strong blur** for a softened mask, or **Keep faces clear here** to disable automatic face masking inside the box. **Change selected effect** switches an existing box between these choices. A solid cover takes priority where it overlaps a blur. For names or other readable text, a solid cover is safer because blurred text may remain readable. Each box applies only during its selected time range, but its **screen position stays fixed**. Add more boxes for an object that moves. Move the slider to inspect other frames; only boxes active at that time are outlined. Keep-clear affects automatic face masking only. Plate masks, name masks, and manually covered areas still apply. If another person enters a keep-clear box during its time range, their face can be left clear. Review the whole result before sharing it.
+
+For a folder, process it first, select a finished video with **‹ Previous** or **Next ›**, then draw areas for that video's source. Click **Reprocess selected video with drawn areas** to create a new result without changing the other videos. The earlier output remains on disk so you can compare it; share only the corrected version after reviewing it. From the command line, use repeatable `--hide-region x,y,width,height,start,end`, `--blur-region x,y,width,height,start,end`, and `--keep-face-region x,y,width,height,start,end` options; omit start and end to apply a box to the whole clip.
 
 The interface uses Python's Tkinter. If Homebrew Python reports `No module named '_tkinter'`, install the matching Tk package, for example `brew install python-tk@3.14` for Python 3.14. Then rerun `python desktop_app.py` from the same Python environment.
 
@@ -63,7 +71,7 @@ python main.py --input my_video.mp4 --audio-mode keep --output output/original_a
 ## Current limitations
 
 - Type detection uses conservative visual rules. Different meeting layouts, static dashcam footage, or mixed-content recordings may be classified as `unknown` or incorrectly; use `--video-type` after reviewing the video.
-- Automatic participant-name masking only covers the recognized two-by-two grid. Other meeting layouts and labels outside those four zones need `--name-region` or a later desktop editing interface.
+- Automatic participant-name masking only covers the recognized two-by-two grid. Other meeting layouts and labels outside those four zones need drawn solid cover areas in the desktop app or `--name-region` from the command line.
 - Detection can miss faces or plates; review the entire output before sharing it.
 - The default `keep` mode leaves the source audio unchanged. `alter` may still leave speakers recognizable and does not censor spoken names or other content.
 - The script does not automatically redact names outside the four recognized label zones, chat messages, browser tabs, location clues, or other identifiers.
