@@ -4,11 +4,9 @@ import argparse
 from dataclasses import asdict
 import json
 from pathlib import Path
-import os
-import subprocess
 
 import cv2
-from imageio_ffmpeg import get_ffmpeg_exe
+from audio_processing import finish_video
 from meeting_names import (
     is_standard_two_by_two,
     parse_region,
@@ -102,29 +100,6 @@ def pixelate(frame, box, pad_x_ratio=0.15, pad_y_ratio=0.30):
     )
 
 
-def remux_original_audio(video_only_path, source_path, output_path):
-    """Copy the processed video and original audio into the final MP4."""
-    command = [
-        get_ffmpeg_exe(),
-        "-y",
-        "-i",
-        str(video_only_path),
-        "-i",
-        str(source_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a?",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "copy",
-        "-shortest",
-        str(output_path),
-    ]
-    subprocess.run(command, check=True, capture_output=True, text=True)
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=INPUT_PATH)
@@ -135,7 +110,14 @@ def main(argv=None):
                         metavar="X,Y,WIDTH,HEIGHT", help="Cover an additional name region in pixel coordinates; repeat as needed")
     parser.add_argument("--no-auto-names", action="store_true",
                         help="Disable standard two-by-two meeting label masks")
+    parser.add_argument("--audio-mode", choices=("keep", "mute", "alter"), default="keep",
+                        help="Keep original audio, remove audio, or shift voice pitch locally")
+    parser.add_argument("--pitch-semitones", type=int, default=-4,
+                        help="Pitch shift for --audio-mode alter (-6..-1 or 1..6; default: -4)")
     args = parser.parse_args(argv)
+
+    if args.audio_mode == "alter" and (args.pitch_semitones == 0 or not -6 <= args.pitch_semitones <= 6):
+        parser.error("--pitch-semitones must be -6..-1 or 1..6 when altering audio")
 
     if not args.input.exists():
         raise FileNotFoundError(f"Input video not found: {args.input}")
@@ -205,6 +187,11 @@ def main(argv=None):
         raise RuntimeError(f"Could not create temporary video: {temp_video_path}")
 
     print(f"Profile: {video_type}; input: {width}x{height}, {fps:.3f} FPS, {frame_count} frames")
+    print(f"Audio mode: {args.audio_mode}")
+    if args.audio_mode == "alter":
+        print("Warning: a pitch shift changes the sound but may not conceal speaker identity or spoken personal information.")
+    elif args.audio_mode == "keep":
+        print("Warning: original audio is retained and may contain identifying information.")
     plate_tracks = []
     face_tracks = []
     processed = 0
@@ -260,14 +247,10 @@ def main(argv=None):
     if processed != frame_count:
         raise RuntimeError(f"Decoded {processed} frames, expected {frame_count}")
 
-    try:
-        remux_original_audio(temp_video_path, args.input, args.output)
-    except subprocess.CalledProcessError as error:
-        print("Warning: audio remux failed; keeping the processed video without audio.")
-        print(error.stderr)
-        os.replace(temp_video_path, args.output)
-    else:
-        temp_video_path.unlink()
+    finish_video(
+        temp_video_path, args.input, args.output,
+        mode=args.audio_mode, semitones=args.pitch_semitones,
+    )
 
     print(f"Created: {args.output}")
 

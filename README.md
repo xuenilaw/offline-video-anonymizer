@@ -1,6 +1,6 @@
 # Offline video anonymization proof of concept
 
-This is an early, local Python proof of concept that pixelates detected faces and vehicle license plates in an MP4 video. It is **not yet a desktop application** and does not process voices.
+This is an early, local Python proof of concept that pixelates detected faces and vehicle license plates in an MP4 video. It is **not yet a desktop application**. Audio can be kept, removed, or pitch-shifted locally.
 
 ## Run locally
 
@@ -9,7 +9,7 @@ This is an early, local Python proof of concept that pixelates detected faces an
 3. Put a video you are authorized to process at `test_video.mp4` in this directory, or pass its path with `--input`.
 4. Run `python main.py`.
 
-The result is written to `output/blurred_faces_and_plates.mp4` unless you pass `--output`. The script copies the source audio into the output. If audio remuxing fails, it produces a video without audio and prints a warning.
+The result is written to `output/blurred_faces_and_plates.mp4` unless you pass `--output`. The default audio mode is `keep`, which copies the original audio. An audio-processing failure stops with an error; it does not silently substitute another audio mode.
 
 ## Video type suggestion
 
@@ -30,12 +30,22 @@ python main.py --input my_video.mp4 --video-type meeting --name-region 160,320,2
 
 Use `--no-auto-names` to disable the four inferred masks when they are misplaced. Review every frame for visible names and captions before sharing the result. The name masks are opaque because softened text can remain readable.
 
+## Audio choices
+
+```bash
+python main.py --input my_video.mp4 --audio-mode mute --output output/muted.mp4
+python main.py --input my_video.mp4 --audio-mode alter --pitch-semitones -4 --output output/altered.mp4
+python main.py --input my_video.mp4 --audio-mode keep --output output/original_audio.mp4
+```
+
+`mute` removes the audio stream. `alter` processes the first audio stream with local FFmpeg filters, shifting pitch and formants while keeping roughly the original speaking speed. The allowed shift is -6 to -1 or 1 to 6 semitones; the default is -4. If the source has no audio stream, `alter` stops with an error. Pitch shifting does **not** guarantee that a speaker cannot be recognized, and it does not remove personal information spoken aloud. Listen to and review the result before sharing it.
+
 ## Current limitations
 
 - Type detection uses conservative visual rules. Different meeting layouts, static dashcam footage, or mixed-content recordings may be classified as `unknown` or incorrectly; use `--video-type` after reviewing the video.
 - Automatic participant-name masking only covers the recognized two-by-two grid. Other meeting layouts and labels outside those four zones need `--name-region` or a later desktop editing interface.
 - Detection can miss faces or plates; review the entire output before sharing it.
-- The source audio is unchanged and may identify speakers or contain personal information.
+- The default `keep` mode leaves the source audio unchanged. `alter` may still leave speakers recognizable and does not censor spoken names or other content.
 - The script does not automatically redact names outside the four recognized label zones, chat messages, browser tabs, location clues, or other identifiers.
 
 This repository contains no sample or processed recordings. Local video files and `output/` are excluded by `.gitignore` because they may contain personal data or material that cannot be redistributed.
