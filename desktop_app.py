@@ -1,10 +1,12 @@
 """Small offline desktop front end for the video anonymizer."""
 
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -93,6 +95,10 @@ class ProgressEstimator:
         self.finished = min(self.total, self.finished + frame_count)
 
 
+class ProcessingCancelled(Exception):
+    """The user stopped the current processing job."""
+
+
 class AnonymizerApp:
     def __init__(self, root):
         self.root = root
@@ -101,6 +107,9 @@ class AnonymizerApp:
         root.geometry("1120x760")
         self.events = queue.Queue()
         self.running = False
+        self.cancel_requested = threading.Event()
+        self.process_lock = threading.Lock()
+        self.active_process = None
         self.analysis = None
         self.results = []
         self.result_configs = []
@@ -224,9 +233,12 @@ class AnonymizerApp:
 
         self.run_button = ttk.Button(left, text="Create anonymized video", command=self._process)
         self.run_button.grid(row=4, column=0, sticky="ew", pady=(2, 0))
-        ttk.Label(left, textvariable=self.progress, wraplength=550).grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.cancel_button = ttk.Button(left, text="Cancel processing", command=self._cancel,
+                                        state="disabled")
+        self.cancel_button.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(left, textvariable=self.progress, wraplength=550).grid(row=6, column=0, sticky="w", pady=(6, 0))
         ttk.Label(left, text="Review every result before sharing. Automatic detection can miss details.",
-                  wraplength=550).grid(row=6, column=0, sticky="w", pady=(6, 0))
+                  wraplength=550).grid(row=7, column=0, sticky="w", pady=(6, 0))
 
         ttk.Label(right, text="Result preview", font=("TkDefaultFont", 14, "bold")).grid(
             row=0, column=0, sticky="w", pady=(0, 8)
@@ -395,15 +407,52 @@ class AnonymizerApp:
         self.batch_checkbox.configure(state="normal" if selected == "auto" else "disabled")
         self._mask_changed()
 
-    def _start(self, worker):
+    def _start(self, worker, *, cancellable=False):
         if self.running:
             return
         self.running = True
+        self.cancel_requested.clear()
         self.run_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal" if cancellable else "disabled")
         self.analyze_button.configure(state="disabled")
         for button in self.mode_buttons:
             button.configure(state="disabled")
         threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_process(self, process, *, force=False):
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            elif force:
+                process.kill()
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+
+    def _request_stop_process(self, process):
+        self._stop_process(process)
+        timer = threading.Timer(3, self._stop_process, args=(process,), kwargs={"force": True})
+        timer.daemon = True
+        timer.start()
+
+    def _cancel(self):
+        if not self.running or self.cancel_requested.is_set():
+            return
+        self.cancel_requested.set()
+        self.cancel_button.configure(state="disabled")
+        self.progress.set("Cancelling processing…")
+        self.remaining_time.set("Stopping current video…")
+        with self.process_lock:
+            process = self.active_process
+        if process is not None:
+            self._request_stop_process(process)
+
+    def _check_cancelled(self):
+        if self.cancel_requested.is_set():
+            raise ProcessingCancelled
 
     def _analyze(self):
         if self.input_mode.get() == "folder":
@@ -493,17 +542,32 @@ class AnonymizerApp:
         return command
 
     def _run_command_with_progress(self, command, estimator, frame_count):
+        self._check_cancelled()
         process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for line in process.stdout:
-            self.events.put(("log", line))
-            match = FRAME_PROGRESS.fullmatch(line.strip())
-            if match:
-                processed, reported_total = map(int, match.groups())
-                self.events.put(("meter", estimator.snapshot(
-                    min(processed, frame_count), finalizing=processed >= reported_total
-                )))
-        return process.wait()
+                                   stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                   start_new_session=(os.name == "posix"))
+        with self.process_lock:
+            self.active_process = process
+            if self.cancel_requested.is_set():
+                self._request_stop_process(process)
+        try:
+            for line in process.stdout:
+                self.events.put(("log", line))
+                match = FRAME_PROGRESS.fullmatch(line.strip())
+                if match:
+                    processed, reported_total = map(int, match.groups())
+                    self.events.put(("meter", estimator.snapshot(
+                        min(processed, frame_count), finalizing=processed >= reported_total
+                    )))
+            return process.wait()
+        finally:
+            process.stdout.close()
+            with self.process_lock:
+                self.active_process = None
+            if self.cancel_requested.is_set():
+                destination = Path(command[command.index("--output") + 1])
+                for suffix in ("_video_only.mp4", ".audio_tmp.mp4"):
+                    destination.with_name(f".{destination.stem}{suffix}").unlink(missing_ok=True)
 
     def _process(self):
         try:
@@ -522,10 +586,14 @@ class AnonymizerApp:
             reserved = set()
             try:
                 self.events.put(("meter", (0, "Reading video lengths…")))
-                frame_counts = [video_frame_count(source) for source in settings["sources"]]
+                frame_counts = []
+                for source in settings["sources"]:
+                    self._check_cancelled()
+                    frame_counts.append(video_frame_count(source))
                 estimator = ProgressEstimator(frame_counts)
                 self.events.put(("meter", estimator.snapshot()))
                 for index, source in enumerate(settings["sources"], 1):
+                    self._check_cancelled()
                     frame_count = frame_counts[index - 1]
                     destination = (unique_destination(source, settings["destination"], reserved)
                                    if settings["folder"] else settings["destination"])
@@ -546,7 +614,10 @@ class AnonymizerApp:
                             self.events.put(("log", f"Suggested type: {analysis.video_type}; "
                                                     f"masks: faces={masks[0]}, plates={masks[1]}, names={masks[2]}\n"))
                         command = self._command(source, destination, settings, video_type, masks)
-                        if self._run_command_with_progress(command, estimator, frame_count) != 0:
+                        returncode = self._run_command_with_progress(command, estimator, frame_count)
+                        if returncode != 0 and self.cancel_requested.is_set():
+                            raise ProcessingCancelled
+                        if returncode != 0:
                             failed += 1
                             self.events.put(("log", f"Failed: {source.name}. See the error above.\n"))
                         else:
@@ -555,17 +626,21 @@ class AnonymizerApp:
                                 destination.resolve(), source.resolve(), settings, video_type, masks, False
                             )))
                     except (OSError, ValueError, RuntimeError) as error:
+                        self._check_cancelled()
                         failed += 1
                         self.events.put(("log", f"Failed: {source.name}: {error}\n"))
                     estimator.finish_file(frame_count)
                     self.events.put(("meter", estimator.snapshot()))
+                self._check_cancelled()
                 self.events.put(("batch_completed", (completed, failed)))
+            except ProcessingCancelled:
+                self.events.put(("cancelled", (completed, failed)))
             except OSError as error:
                 self.events.put(("error", str(error)))
             finally:
                 self.events.put(("done", None))
 
-        self._start(worker)
+        self._start(worker, cancellable=True)
 
     def _reprocess_selected(self):
         if self.running or self.result_index < 0:
@@ -587,24 +662,33 @@ class AnonymizerApp:
         def worker():
             try:
                 self.events.put(("meter", (0, "Reading video length…")))
+                self._check_cancelled()
                 frame_count = video_frame_count(source)
                 estimator = ProgressEstimator([frame_count])
                 self.events.put(("meter", estimator.snapshot()))
                 command = self._command(source, destination, settings, video_type, masks)
-                if self._run_command_with_progress(command, estimator, frame_count) == 0:
+                returncode = self._run_command_with_progress(command, estimator, frame_count)
+                if returncode != 0 and self.cancel_requested.is_set():
+                    raise ProcessingCancelled
+                if returncode == 0:
                     self.events.put(("file_completed", (
                         destination.resolve(), source, settings, video_type, masks, True
                     )))
                     self.events.put(("batch_completed", (1, 0)))
                 else:
                     self.events.put(("batch_completed", (0, 1)))
+            except ProcessingCancelled:
+                self.events.put(("cancelled", (0, 0)))
             except (OSError, ValueError) as error:
+                if self.cancel_requested.is_set():
+                    self.events.put(("cancelled", (0, 0)))
+                    return
                 self.events.put(("log", f"Reprocessing failed: {error}\n"))
                 self.events.put(("batch_completed", (0, 1)))
             finally:
                 self.events.put(("done", None))
 
-        self._start(worker)
+        self._start(worker, cancellable=True)
 
     def _log(self, message):
         self.log.configure(state="normal")
@@ -664,8 +748,11 @@ class AnonymizerApp:
                 elif kind == "log":
                     self._log(payload)
                 elif kind == "progress":
-                    self.progress.set(payload)
+                    if not self.cancel_requested.is_set():
+                        self.progress.set(payload)
                 elif kind == "meter":
+                    if self.cancel_requested.is_set():
+                        continue
                     percent, remaining = payload
                     self.meter_value.set(percent)
                     self.meter_percent.set(f"{percent}%")
@@ -689,9 +776,16 @@ class AnonymizerApp:
                     self.progress.set(f"Finished: {completed} succeeded, {failed} failed. "
                                       "Use ‹ and › to review each result.")
                     self._log(f"\nFinished: {completed} succeeded, {failed} failed.\n")
+                elif kind == "cancelled":
+                    completed, failed = payload
+                    self.remaining_time.set("Cancelled")
+                    self.progress.set(f"Cancelled. {completed} completed, {failed} failed. "
+                                      "Completed videos remain available for review.")
+                    self._log(f"\nCancelled: {completed} completed, {failed} failed.\n")
                 elif kind == "done":
                     self.running = False
                     self.run_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
                     for button in self.mode_buttons:
                         button.configure(state="normal")
                     self.analyze_button.configure(state="disabled" if self.input_mode.get() == "folder"
