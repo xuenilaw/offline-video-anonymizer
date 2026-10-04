@@ -106,6 +106,12 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
     parser.add_argument("--video-type", choices=("auto", "meeting", "dashcam", "normal"), default="auto")
     parser.add_argument("--analyze-only", action="store_true", help="Print the type suggestion without processing")
+    parser.add_argument("--faces", action=argparse.BooleanOptionalAction, default=None,
+                        help="Mask faces (default: on for every profile)")
+    parser.add_argument("--plates", action=argparse.BooleanOptionalAction, default=None,
+                        help="Mask plates (default: on only for dashcam)")
+    parser.add_argument("--names", action=argparse.BooleanOptionalAction, default=None,
+                        help="Mask meeting names (default: on only for meeting)")
     parser.add_argument("--name-region", type=parse_region, action="append", default=[],
                         metavar="X,Y,WIDTH,HEIGHT", help="Cover an additional name region in pixel coordinates; repeat as needed")
     parser.add_argument("--no-auto-names", action="store_true",
@@ -130,20 +136,27 @@ def main(argv=None):
         return
 
     video_type = analysis.video_type if args.video_type == "auto" else args.video_type
-    if video_type == "unknown":
-        parser.error("Video type is uncertain. Review the video and choose --video-type meeting, dashcam, or normal.")
+    if video_type == "unknown" and any(value is None for value in (args.faces, args.plates, args.names)):
+        parser.error("Video type is uncertain. Choose --video-type or explicitly set --faces/--no-faces, --plates/--no-plates, and --names/--no-names.")
+    mask_faces = True if args.faces is None else args.faces
+    mask_plates = (video_type == "dashcam") if args.plates is None else args.plates
+    mask_names = (video_type == "meeting") if args.names is None else args.names
+    if not (mask_faces or mask_plates or mask_names):
+        parser.error("Select at least one visual identifier to mask")
+    if not mask_names and args.name_region:
+        parser.error("--name-region requires --names")
     if args.input.resolve() == args.output.resolve():
         raise ValueError("Input and output paths must differ")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temp_video_path = args.output.with_name(f".{args.output.stem}_video_only.mp4")
     detector = None
-    if video_type == "dashcam":
+    if mask_plates:
         detector_path = Path(cv2.data.haarcascades) / "haarcascade_russian_plate_number.xml"
         detector = cv2.CascadeClassifier(str(detector_path))
         if detector.empty():
             raise RuntimeError(f"Could not load plate detector: {detector_path}")
-    if not FACE_MODEL_PATH.exists():
+    if mask_faces and not FACE_MODEL_PATH.exists():
         raise FileNotFoundError(f"Face detector model not found: {FACE_MODEL_PATH}")
 
     capture = cv2.VideoCapture(str(args.input))
@@ -159,8 +172,8 @@ def main(argv=None):
             capture.release()
             parser.error(f"Name region origin ({x},{y}) is outside the {width}x{height} video")
 
-    name_regions = list(args.name_region)
-    if video_type == "meeting" and not args.no_auto_names:
+    name_regions = list(args.name_region) if mask_names else []
+    if mask_names and video_type == "meeting" and not args.no_auto_names:
         if analysis is None:
             analysis = analyze_video(args.input)
         if is_standard_two_by_two(analysis):
@@ -168,17 +181,16 @@ def main(argv=None):
             print("Using four standard meeting label masks; review all names and captions in the output.")
         else:
             print("Standard meeting layout not recognized; add --name-region for each visible label.")
-    if video_type == "meeting" and not name_regions:
-        print("Warning: no participant name regions are masked.")
+    if mask_names and not name_regions:
+        capture.release()
+        parser.error("Names were selected, but no name regions are available. Add --name-region or deselect names.")
 
-    face_detector = cv2.FaceDetectorYN.create(
-        str(FACE_MODEL_PATH),
-        "",
-        (width, height),
-        score_threshold=0.45,
-        nms_threshold=0.3,
-        top_k=5000,
-    )
+    face_detector = None
+    if mask_faces:
+        face_detector = cv2.FaceDetectorYN.create(
+            str(FACE_MODEL_PATH), "", (width, height),
+            score_threshold=0.45, nms_threshold=0.3, top_k=5000,
+        )
     writer = cv2.VideoWriter(
         str(temp_video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
     )
@@ -187,6 +199,9 @@ def main(argv=None):
         raise RuntimeError(f"Could not create temporary video: {temp_video_path}")
 
     print(f"Profile: {video_type}; input: {width}x{height}, {fps:.3f} FPS, {frame_count} frames")
+    print(f"Visual masks: faces={mask_faces}, plates={mask_plates}, names={mask_names}")
+    if mask_plates and video_type != "dashcam":
+        print("Warning: plate detection outside dashcam footage may mask captions or other text.")
     print(f"Audio mode: {args.audio_mode}")
     if args.audio_mode == "alter":
         print("Warning: a pitch shift changes the sound but may not conceal speaker identity or spoken personal information.")
@@ -203,13 +218,12 @@ def main(argv=None):
                 break
 
             # Detect on the unmodified frame so one mask cannot hide another.
-            _, raw_faces = face_detector.detect(frame)
             face_detections = []
-            if raw_faces is not None:
-                face_detections = [
-                    tuple(map(int, face[:4])) for face in raw_faces
-                ]
-            update_tracks(face_tracks, face_detections)
+            if mask_faces:
+                _, raw_faces = face_detector.detect(frame)
+                if raw_faces is not None:
+                    face_detections = [tuple(map(int, face[:4])) for face in raw_faces]
+                update_tracks(face_tracks, face_detections)
 
             if detector is not None:
                 gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))

@@ -1,6 +1,24 @@
 # Offline video anonymization proof of concept
 
-This is an early, local Python proof of concept that pixelates detected faces and vehicle license plates in an MP4 video. It is **not yet a desktop application**. Audio can be kept, removed, or pitch-shifted locally.
+This is an early, local Python proof of concept with a small desktop interface. It pixelates selected faces and vehicle license plates and can cover participant-name rectangles in an MP4 video. Audio can be kept, removed, or pitch-shifted locally.
+
+## Desktop interface
+
+After installing the dependencies below, run:
+
+```bash
+python desktop_app.py
+```
+
+Choose **One video** or **Folder of videos**. For one video, the app analyzes a few frames locally and suggests a starting preset. **Online meeting** initially selects faces and participant names; **Dashcam footage** initially selects faces and vehicle plates; **Phone or camera video** initially selects faces. You can change any checkbox before selecting **Create anonymized video**.
+
+For a folder, select the source folder and a separate output folder. The app processes MP4, MOV, MKV, and AVI files directly inside the source folder, one at a time; it does not scan subfolders. With **Let the app suggest** and **Use recommended masks for each video in the folder** selected, every video gets its own type suggestion and matching masks. The visible checkboxes are the fallback when a type is uncertain. Turn off that option, or choose a specific source type, to apply the displayed checkboxes to every video. Each output is an MP4 named after its source with `_anonymized`; an existing result gets a numbered suffix rather than being overwritten. Individual failures are reported in the processing details while the remaining videos continue.
+
+Finished videos appear in the preview on the right. Use **‹ Previous** and **Next ›** to switch results, **Play** to review a result in the app, or **Open full video** to use your usual player. On macOS, the in-app preview also plays sound when the output has an audio track. The preview prepares a temporary local MP3 for sound and deletes it when the app closes. On other systems, use **Open full video** to check sound.
+
+Extra name rectangles are under **Advanced: add name areas**. Enter `x,y,width,height` in source-video pixels, separating multiple rectangles with semicolons. Automatic name rectangles currently cover only the recognized two-by-two meeting layout. The interface runs the existing Python processing scripts locally; it does not upload video. This is a source-code desktop prototype, not a packaged installer yet.
+
+The interface uses Python's Tkinter. If Homebrew Python reports `No module named '_tkinter'`, install the matching Tk package, for example `brew install python-tk@3.14` for Python 3.14. Then rerun `python desktop_app.py` from the same Python environment.
 
 ## Run locally
 
@@ -21,6 +39,8 @@ python main.py --input my_video.mp4 --video-type meeting --output output/meeting
 ```
 
 You can also run `python video_type.py my_video.mp4` to get the analysis as JSON. The `meeting` profile detects faces but skips license plates, preventing the plate detector from pixelating captions. The `dashcam` profile detects faces and plates; `normal` detects faces. These are current defaults, not final privacy decisions.
+
+Override the visual masks independently with `--faces`/`--no-faces`, `--plates`/`--no-plates`, and `--names`/`--no-names`. For example, `--video-type meeting --no-plates --faces --names` keeps the plate detector away from subtitles. When automatic type detection is uncertain, either choose `--video-type` or set all three mask switches explicitly. Masking names needs matching rectangles; the automatic name rectangles are limited to the recognized two-by-two meeting layout.
 
 For a recognized two-by-two meeting grid, the meeting profile also covers four expected participant-name areas with solid dark bars. This works for the tested Meet layout, but label positions vary among apps and window sizes. You can add a name mask using pixel coordinates from the original video; repeat the option for more labels:
 
