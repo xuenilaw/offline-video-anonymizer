@@ -14,6 +14,7 @@ import time
 
 try:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import filedialog, messagebox, ttk
 except ImportError as error:
     raise SystemExit(
@@ -99,6 +100,44 @@ class ProcessingCancelled(Exception):
     """The user stopped the current processing job."""
 
 
+class PrimaryAction(tk.Frame):
+    """A keyboard-accessible action with a consistent colored background."""
+
+    def __init__(self, parent, text, command):
+        self._color = "#1769aa"
+        self._enabled = True
+        self._command = command
+        super().__init__(parent, background=self._color, takefocus=1,
+                         highlightthickness=2, highlightbackground=self._color,
+                         highlightcolor="#0b4678")
+        self._caption = tk.Label(self, text=text, background=self._color, foreground="white",
+                                 font=("TkDefaultFont", 12, "bold"), cursor="hand2")
+        self._caption.pack(fill="both", expand=True, ipady=7)
+        self.bind("<Button-1>", self._invoke)
+        self._caption.bind("<Button-1>", self._invoke)
+        self.bind("<Return>", self._invoke)
+        self.bind("<space>", self._invoke)
+
+    def _invoke(self, _event=None):
+        if self._enabled:
+            self.focus_set()
+            self._command()
+        return "break"
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        if "text" in kwargs:
+            self._caption.configure(text=kwargs.pop("text"))
+        if "state" in kwargs:
+            self._enabled = kwargs.pop("state") == "normal"
+            color = self._color if self._enabled else "#8c99a3"
+            self._caption.configure(background=color, cursor="hand2" if self._enabled else "arrow")
+            super().configure(background=color, highlightbackground=color)
+        if kwargs:
+            return super().configure(**kwargs)
+
+
 class AnonymizerApp:
     def __init__(self, root):
         self.root = root
@@ -136,34 +175,44 @@ class AnonymizerApp:
 
         container = ttk.Frame(root, padding=18)
         container.pack(fill="both", expand=True)
-        container.columnconfigure(0, weight=3)
-        container.columnconfigure(1, weight=2)
+        container.columnconfigure(0, weight=1)
         container.rowconfigure(1, weight=1)
         ttk.Label(container, text="Offline Video Anonymizer", font=("TkDefaultFont", 20, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w"
+            row=0, column=0, sticky="w"
         )
-        left_area = ttk.Frame(container)
-        left_area.grid(row=1, column=0, sticky="nsew", padx=(0, 18), pady=(14, 0))
+        self.panes = ttk.PanedWindow(container, orient="horizontal")
+        self.panes.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
+        left_area = ttk.Frame(self.panes, padding=(0, 0, 8, 0))
         left_area.columnconfigure(0, weight=1)
         left_area.rowconfigure(0, weight=1)
-        left_canvas = tk.Canvas(left_area, highlightthickness=0)
-        left_canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(left_area, orient="vertical", command=left_canvas.yview)
+        self.settings_canvas = tk.Canvas(left_area, highlightthickness=0)
+        self.settings_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(left_area, orient="vertical", command=self.settings_canvas.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
-        left_canvas.configure(yscrollcommand=scrollbar.set)
-        left = ttk.Frame(left_canvas)
+        self.settings_canvas.configure(yscrollcommand=scrollbar.set)
+        left = ttk.Frame(self.settings_canvas)
         left.columnconfigure(0, weight=1)
-        left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
-        left.bind("<Configure>", lambda _event: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
-        left_canvas.bind("<Configure>", lambda event: left_canvas.itemconfigure(left_window, width=event.width))
-        left_canvas.bind("<MouseWheel>",
-                         lambda event: left_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"))
-        right = ttk.Frame(container)
-        right.grid(row=1, column=1, sticky="nsew", pady=(14, 0))
+        left_window = self.settings_canvas.create_window((0, 0), window=left, anchor="nw")
+        left.bind("<Configure>", lambda _event: self.settings_canvas.configure(
+            scrollregion=self.settings_canvas.bbox("all")))
+        self.settings_canvas.bind("<Configure>", lambda event: self.settings_canvas.itemconfigure(
+            left_window, width=event.width))
+        right = ttk.Frame(self.panes, padding=(8, 0, 0, 0))
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
+        self.panes.add(left_area, weight=3)
+        self.panes.add(right, weight=2)
+        root.bind("<MouseWheel>", self._scroll_settings, add="+")
+        root.bind("<Button-4>", self._scroll_settings, add="+")
+        root.bind("<Button-5>", self._scroll_settings, add="+")
 
-        files = ttk.LabelFrame(left, text="1  Choose video or folder", padding=12)
+        heading_font = tkfont.nametofont("TkDefaultFont").copy()
+        heading_font.configure(size=12, weight="bold")
+        self.heading_font = heading_font
+        ttk.Style(root).configure("Step.TLabelframe.Label", font=heading_font)
+
+        files = ttk.LabelFrame(left, text="1  Choose video or folder", padding=12,
+                               style="Step.TLabelframe")
         files.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         files.columnconfigure(1, weight=1)
         self.mode_buttons = []
@@ -175,7 +224,8 @@ class AnonymizerApp:
         self.input_label = self._file_row(files, 1, "Video to anonymize", self.input_path, self._browse_input)
         self.output_label = self._file_row(files, 2, "Save result as", self.output_path, self._browse_output)
 
-        source = ttk.LabelFrame(left, text="2  Choose a starting point", padding=12)
+        source = ttk.LabelFrame(left, text="2  Choose a starting point", padding=12,
+                                style="Step.TLabelframe")
         source.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         source.columnconfigure(0, weight=1)
         ttk.Label(source, text="What kind of recording is this?").grid(row=0, column=0, sticky="w")
@@ -194,7 +244,8 @@ class AnonymizerApp:
         self.batch_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.batch_checkbox.grid_remove()
 
-        masks = ttk.LabelFrame(left, text="3  What should be hidden?", padding=12)
+        masks = ttk.LabelFrame(left, text="3  What should be hidden?", padding=12,
+                               style="Step.TLabelframe")
         masks.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         masks.columnconfigure(0, weight=1)
         choices = (
@@ -219,7 +270,8 @@ class AnonymizerApp:
             row=8, column=0, sticky="w", pady=(4, 0)
         )
 
-        audio = ttk.LabelFrame(left, text="4  What should happen to the sound?", padding=12)
+        audio = ttk.LabelFrame(left, text="4  What should happen to the sound?", padding=12,
+                               style="Step.TLabelframe")
         audio.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         for row, (label, value) in enumerate((("Keep original sound", "keep"),
                                                ("Mute all sound", "mute"),
@@ -231,7 +283,7 @@ class AnonymizerApp:
         self.pitch_entry.grid(row=2, column=2)
         self._audio_changed()
 
-        self.run_button = ttk.Button(left, text="Create anonymized video", command=self._process)
+        self.run_button = PrimaryAction(left, text="Create anonymized video", command=self._process)
         self.run_button.grid(row=4, column=0, sticky="ew", pady=(2, 0))
         self.cancel_button = ttk.Button(left, text="Cancel processing", command=self._cancel,
                                         state="disabled")
@@ -272,7 +324,17 @@ class AnonymizerApp:
         self.log.pack(fill="both", expand=True)
         self._mask_changed()
         root.protocol("WM_DELETE_WINDOW", self._close)
+        root.after(50, lambda: self.panes.sashpos(0, round(self.panes.winfo_width() * 0.58)))
         root.after(100, self._drain_events)
+
+    def _scroll_settings(self, event):
+        canvas = self.settings_canvas
+        if not (canvas.winfo_rootx() <= event.x_root < canvas.winfo_rootx() + canvas.winfo_width()
+                and canvas.winfo_rooty() <= event.y_root < canvas.winfo_rooty() + canvas.winfo_height()):
+            return
+        direction = -1 if getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4 else 1
+        canvas.yview_scroll(direction, "units")
+        return "break"
 
     def _mask_changed(self):
         selected = [label for label, variable in (("faces", self.faces), ("plates", self.plates),

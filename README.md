@@ -12,6 +12,8 @@ python desktop_app.py
 
 Choose **One video** or **Folder of videos**. For one video, the app analyzes a few frames locally and suggests a starting preset. **Online meeting** initially selects faces and participant names; **Dashcam footage** initially selects faces and vehicle plates; **Phone or camera video** initially selects faces. You can change any checkbox before selecting **Create anonymized video**.
 
+Scroll over the settings on the left to reach all four steps and the main action button. Drag the divider between settings and result preview to give either side more room.
+
 For a folder, select the source folder and a separate output folder. The app processes MP4, MOV, MKV, and AVI files directly inside the source folder, one at a time; it does not scan subfolders. With **Let the app suggest** and **Use recommended masks for each video in the folder** selected, every video gets its own type suggestion and matching masks. The visible checkboxes are the fallback when a type is uncertain. Turn off that option, or choose a specific source type, to apply the displayed checkboxes to every video. Each output is an MP4 named after its source with `_anonymized`; an existing result gets a numbered suffix rather than being overwritten. Individual failures are reported in the processing details while the remaining videos continue.
 
 Finished videos appear in the preview on the right. Use **‹ Previous** and **Next ›** to switch results, **Play** to review a result in the app, or **Open full video** to use your usual player. On macOS, the in-app preview also plays sound when the output has an audio track. The preview prepares a temporary local MP3 for sound and deletes it when the app closes. On other systems, use **Open full video** to check sound.
