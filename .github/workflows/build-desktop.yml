@@ -1,0 +1,41 @@
+name: Build desktop apps
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            artifact: windows-x64
+          - runner: macos-15-intel
+            artifact: macos-intel
+          - runner: macos-15
+            artifact: macos-apple-silicon
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Build desktop app
+        run: python build_desktop.py
+      - name: Check bundled video processing
+        run: python smoke_desktop_bundle.py
+      - name: Pack Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/OfflineVideoAnonymizer -DestinationPath OfflineVideoAnonymizer-${{ matrix.artifact }}.zip
+      - name: Pack macOS app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/OfflineVideoAnonymizer.app OfflineVideoAnonymizer-${{ matrix.artifact }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OfflineVideoAnonymizer-${{ matrix.artifact }}
+          path: OfflineVideoAnonymizer-${{ matrix.artifact }}.zip
+          if-no-files-found: error

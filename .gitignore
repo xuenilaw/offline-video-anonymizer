@@ -10,6 +10,9 @@ __pycache__/
 *.mkv
 *.webm
 output/
+build/
+dist/
+*.spec
 
 # Local configuration and credentials.
 .env

@@ -3,14 +3,17 @@
 import json
 import os
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 import queue
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
 
 try:
     import tkinter as tk
@@ -37,6 +40,43 @@ TYPE_LABELS = {
     "Dashcam footage": "dashcam",
     "Phone or camera video": "normal",
 }
+
+
+def worker_command(kind, log_path, *args):
+    """Launch this app as a worker from Python or a bundled executable."""
+    command = [sys.executable]
+    if not getattr(sys, "frozen", False):
+        command.extend(("-u", str(PROJECT_DIR / "desktop_app.py")))
+    return command + ["--worker", kind, str(log_path), *map(str, args)]
+
+
+def worker_log_path():
+    handle, name = tempfile.mkstemp(prefix="offline-video-anonymizer-", suffix=".log")
+    os.close(handle)
+    return Path(name)
+
+
+def worker_creation_flags():
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def run_worker(kind, log_path, args):
+    """Write worker output to a file; windowed Windows apps have no stdout."""
+    with Path(log_path).open("w", encoding="utf-8", buffering=1) as stream:
+        sys.stdout = stream
+        sys.stderr = stream
+        try:
+            if kind == "analyze":
+                print(json.dumps(asdict(analyze_video(Path(args[0]))), indent=2))
+            elif kind == "process":
+                from main import main as process_video
+                process_video(args)
+            else:
+                raise ValueError(f"Unknown worker operation: {kind}")
+            return 0
+        except BaseException:
+            traceback.print_exc()
+            return 1
 
 
 def unique_destination(source, output_folder, reserved):
@@ -142,6 +182,10 @@ class AnonymizerApp:
     def __init__(self, root):
         self.root = root
         root.title("Offline Video Anonymizer")
+        icon_path = PROJECT_DIR / "assets" / "app-icon.png"
+        if icon_path.is_file():
+            self.app_icon = tk.PhotoImage(file=str(icon_path))
+            root.iconphoto(True, self.app_icon)
         root.minsize(1050, 700)
         root.geometry("1120x760")
         self.events = queue.Queue()
@@ -444,7 +488,9 @@ class AnonymizerApp:
                 count = len(self._videos_in_folder(Path(selected)))
                 self.suggestion.set(f"Found {count} video file(s) in this folder. Subfolders are not included.")
             else:
-                self.output_path.set(str(PROJECT_DIR / "output" / f"{Path(selected).stem}_anonymized.mp4"))
+                video_folder = Path.home() / ("Movies" if sys.platform == "darwin" else "Videos")
+                self.output_path.set(str(video_folder / "Offline Video Anonymizer" /
+                                         f"{Path(selected).stem}_anonymized.mp4"))
                 self.suggestion.set("Checking a few frames locally…")
                 self._analyze()
             self._update_manual_summary()
@@ -487,10 +533,10 @@ class AnonymizerApp:
         try:
             if os.name == "posix":
                 os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-            elif force:
-                process.kill()
             else:
-                process.terminate()
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=worker_creation_flags(), timeout=5)
         except ProcessLookupError:
             pass
 
@@ -510,7 +556,10 @@ class AnonymizerApp:
         with self.process_lock:
             process = self.active_process
         if process is not None:
-            self._request_stop_process(process)
+            if os.name == "nt":
+                threading.Thread(target=self._request_stop_process, args=(process,), daemon=True).start()
+            else:
+                self._request_stop_process(process)
 
     def _check_cancelled(self):
         if self.cancel_requested.is_set():
@@ -526,16 +575,20 @@ class AnonymizerApp:
         self.suggestion.set("Analyzing sampled frames locally…")
 
         def worker():
+            log_path = worker_log_path()
             try:
-                result = subprocess.run([sys.executable, str(PROJECT_DIR / "video_type.py"), str(source)],
-                                        capture_output=True, text=True)
+                result = subprocess.run(worker_command("analyze", log_path, source),
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        creationflags=worker_creation_flags())
+                output = log_path.read_text(encoding="utf-8")
                 if result.returncode:
-                    self.events.put(("error", result.stderr.strip() or result.stdout.strip()))
+                    self.events.put(("error", output.strip() or "Video analysis failed."))
                 else:
-                    self.events.put(("analysis", (str(source.resolve()), result.stdout)))
+                    self.events.put(("analysis", (str(source.resolve()), output)))
             except OSError as error:
                 self.events.put(("error", str(error)))
             finally:
+                log_path.unlink(missing_ok=True)
                 self.events.put(("done", None))
 
         self._start(worker)
@@ -589,7 +642,7 @@ class AnonymizerApp:
         manual = settings["manual_regions"].get(source.resolve(), {})
         if manual.get("keep") and not faces:
             raise ValueError(f"Face masking must be selected to keep a face area clear: {source.name}")
-        command = [sys.executable, "-u", str(PROJECT_DIR / "main.py"), "--input", str(source),
+        command = ["--input", str(source),
                    "--output", str(destination), "--video-type", video_type,
                    "--faces" if faces else "--no-faces",
                    "--plates" if plates else "--no-plates",
@@ -605,27 +658,38 @@ class AnonymizerApp:
 
     def _run_command_with_progress(self, command, estimator, frame_count):
         self._check_cancelled()
-        process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                   start_new_session=(os.name == "posix"))
-        with self.process_lock:
-            self.active_process = process
-            if self.cancel_requested.is_set():
-                self._request_stop_process(process)
+        log_path = worker_log_path()
         try:
-            for line in process.stdout:
-                self.events.put(("log", line))
-                match = FRAME_PROGRESS.fullmatch(line.strip())
-                if match:
-                    processed, reported_total = map(int, match.groups())
-                    self.events.put(("meter", estimator.snapshot(
-                        min(processed, frame_count), finalizing=processed >= reported_total
-                    )))
-            return process.wait()
-        finally:
-            process.stdout.close()
+            process = subprocess.Popen(worker_command("process", log_path, *command),
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       creationflags=worker_creation_flags(),
+                                       start_new_session=(os.name == "posix"))
             with self.process_lock:
-                self.active_process = None
+                self.active_process = process
+                if self.cancel_requested.is_set():
+                    self._request_stop_process(process)
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                    while True:
+                        line = log.readline()
+                        if line:
+                            self.events.put(("log", line))
+                            match = FRAME_PROGRESS.fullmatch(line.strip())
+                            if match:
+                                processed, reported_total = map(int, match.groups())
+                                self.events.put(("meter", estimator.snapshot(
+                                    min(processed, frame_count), finalizing=processed >= reported_total
+                                )))
+                        elif process.poll() is not None:
+                            break
+                        else:
+                            time.sleep(0.05)
+                return process.wait()
+            finally:
+                with self.process_lock:
+                    self.active_process = None
+        finally:
+            log_path.unlink(missing_ok=True)
             if self.cancel_requested.is_set():
                 destination = Path(command[command.index("--output") + 1])
                 for suffix in ("_video_only.mp4", ".audio_tmp.mp4"):
@@ -865,4 +929,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--worker":
+        raise SystemExit(run_worker(sys.argv[2], sys.argv[3], sys.argv[4:]))
     main()

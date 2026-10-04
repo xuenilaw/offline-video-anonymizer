@@ -22,7 +22,7 @@ Finished videos appear in the preview on the right. Use **‹ Previous** and **N
 
 Click **Cancel processing** to stop a single video, a folder job, or a manual reprocessing job. In a folder job, videos already completed stay available in the result preview; the current video stops and the remaining videos are skipped. The app removes temporary files from the interrupted video. You can start another job after cancellation finishes.
 
-Automatic name rectangles currently cover only the recognized two-by-two meeting layout. For other layouts, use **Draw cover / blur / keep-clear areas…** to cover the visible names. The interface runs the existing Python processing scripts locally; it does not upload video. This is a source-code desktop prototype, not a packaged installer yet.
+Automatic name rectangles currently cover only the recognized two-by-two meeting layout. For other layouts, use **Draw cover / blur / keep-clear areas…** to cover the visible names. The interface runs locally; it does not upload video.
 
 ### Correct missed areas by hand
 
@@ -31,6 +31,33 @@ Select a video and click **Draw cover / blur / keep-clear areas…**. In the sou
 For a folder, process it first, select a finished video with **‹ Previous** or **Next ›**, then draw areas for that video's source. Click **Reprocess selected video with drawn areas** to create a new result without changing the other videos. The earlier output remains on disk so you can compare it; share only the corrected version after reviewing it. From the command line, use repeatable `--hide-region x,y,width,height,start,end`, `--blur-region x,y,width,height,start,end`, and `--keep-face-region x,y,width,height,start,end` options; omit start and end to apply a box to the whole clip.
 
 The interface uses Python's Tkinter. If Homebrew Python reports `No module named '_tkinter'`, install the matching Tk package, for example `brew install python-tk@3.14` for Python 3.14. Then rerun `python desktop_app.py` from the same Python environment.
+
+### Build the desktop app
+
+Build on each operating system separately. With Python 3.14 and Tkinter available, run:
+
+```bash
+python -m pip install -r requirements-build.txt
+python build_desktop.py
+python smoke_desktop_bundle.py
+```
+
+**Windows, from PowerShell:** Install 64-bit Python 3.14, download or clone this repository, and open PowerShell in the project folder. Run these commands; they use the virtual environment directly, so activation is not needed:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\.venv\Scripts\python.exe build_desktop.py
+.\.venv\Scripts\python.exe smoke_desktop_bundle.py
+```
+
+If `py -3.14` is unavailable but `python` points to Python 3.14, use `python -m venv .venv` for the first command. After the smoke check passes, double-click `dist\OfflineVideoAnonymizer\OfflineVideoAnonymizer.exe`. Keep the whole `OfflineVideoAnonymizer` folder together when moving it to another Windows PC.
+
+On macOS, open `dist/OfflineVideoAnonymizer.app`. The `build/` folder contains intermediate files, not the app to launch. A macOS build does not create a Windows `.exe`; build it on Windows or download the Windows artifact from the manually triggered GitHub Actions workflow. The app uses its bundled Python, models, and FFmpeg binary; users do not need to install Python. A single-video default output goes into `~/Videos/Offline Video Anonymizer` on Windows or `~/Movies/Offline Video Anonymizer` on macOS. Folder jobs continue to default to an `anonymized` subfolder beside the input videos.
+
+The GitHub Actions **Build desktop apps** workflow can be started manually to produce review ZIP files for Windows x64, Intel Macs, and Apple Silicon Macs. It runs the synthetic-video smoke check on each platform. These are unsigned review builds, not a public release. Downloaded macOS apps need Developer ID signing and notarization for a smooth first launch; Windows downloads may show a SmartScreen warning until signed and trusted. Review [third-party redistribution requirements](THIRD_PARTY.md), especially the bundled FFmpeg binary and its corresponding source, before publishing downloads.
+
+The app icon is generated from `assets/app-icon.svg`; the checked-in `.icns` and `.ico` files are used by the Mac and Windows builds. To change it, install `requirements-icons.txt` and run `python make_app_icons.py` before rebuilding.
 
 ## Run locally
 
