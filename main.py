@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 
 import cv2
@@ -93,12 +94,50 @@ def pixelate(frame, box, pad_x_ratio=0.15, pad_y_ratio=0.30):
     if region.size == 0:
         return
 
-    tiny_width = max(4, (x2 - x1) // 14)
-    tiny_height = max(3, (y2 - y1) // 14)
+    # Limit the number of blocks, not just their pixel size: a 600 px face
+    # should still collapse to a coarse mosaic rather than ~40 blocks wide.
+    tiny_width = min(8, max(2, (x2 - x1) // 10))
+    tiny_height = min(8, max(2, (y2 - y1) // 10))
     tiny = cv2.resize(region, (tiny_width, tiny_height), interpolation=cv2.INTER_AREA)
     frame[y1:y2, x1:x2] = cv2.resize(
         tiny, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST
     )
+
+
+def detect_faces(frame, detector, video_type):
+    """Detect full-size faces, plus small faces in enlarged dashcam tiles."""
+    height, width = frame.shape[:2]
+    _, raw = detector.detect(frame)
+    candidates = []
+    if raw is not None:
+        candidates.extend((tuple(map(int, face[:4])), float(face[-1])) for face in raw)
+
+    if video_type == "dashcam" and width >= 960 and height >= 540:
+        tile_width = round(width * 0.56)
+        tile_height = round(height * 0.56)
+        for y in (0, height - tile_height):
+            for x in (0, width - tile_width):
+                tile = frame[y:y + tile_height, x:x + tile_width]
+                enlarged = cv2.resize(tile, (width, height), interpolation=cv2.INTER_LINEAR)
+                _, small_faces = detector.detect(enlarged)
+                if small_faces is None:
+                    continue
+                for face in small_faces:
+                    if face[-1] < 0.45:
+                        continue
+                    box = (
+                        max(0, round(x + face[0] * tile_width / width)),
+                        max(0, round(y + face[1] * tile_height / height)),
+                        max(1, round(face[2] * tile_width / width)),
+                        max(1, round(face[3] * tile_height / height)),
+                    )
+                    candidates.append((box, float(face[-1])))
+
+    selected = []
+    for box, score in sorted(candidates, key=lambda candidate: candidate[1], reverse=True):
+        if not any(overlap_score(box, chosen) >= 0.25 for chosen in selected):
+            selected.append(box)
+    return selected
 
 
 def clipped_region(box, width, height):
@@ -192,9 +231,13 @@ def main(argv=None):
         raise RuntimeError(f"Could not open input video: {args.input}")
 
     fps = capture.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30.0
+        print("Warning: frame rate is missing; using 30 FPS for the output and timed regions.")
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    reported_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+    frame_count = int(reported_count) if math.isfinite(reported_count) and reported_count > 0 else 0
     for region in args.name_region + args.hide_region + args.blur_region + args.keep_face_region:
         x, y = region[:2]
         if x >= width or y >= height:
@@ -229,7 +272,8 @@ def main(argv=None):
         capture.release()
         raise RuntimeError(f"Could not create temporary video: {temp_video_path}")
 
-    print(f"Profile: {video_type}; input: {width}x{height}, {fps:.3f} FPS, {frame_count} frames")
+    print(f"Profile: {video_type}; input: {width}x{height}, {fps:.3f} FPS, "
+          f"reported frames: {frame_count or 'unknown'}")
     print(f"Visual masks: faces={mask_faces}, plates={mask_plates}, names={mask_names}")
     print(f"Manual regions: opaque={len(args.hide_region)}, blur={len(args.blur_region)}, "
           f"keep faces clear={len(args.keep_face_region)}")
@@ -254,9 +298,7 @@ def main(argv=None):
             # Detect on the unmodified frame so one mask cannot hide another.
             face_detections = []
             if mask_faces:
-                _, raw_faces = face_detector.detect(frame)
-                if raw_faces is not None:
-                    face_detections = [tuple(map(int, face[:4])) for face in raw_faces]
+                face_detections = detect_faces(frame, face_detector, video_type)
                 update_tracks(face_tracks, face_detections)
 
             if detector is not None:
@@ -305,14 +347,16 @@ def main(argv=None):
 
             writer.write(frame)
             processed += 1
-            if processed % progress_interval == 0 or processed == frame_count:
-                print(f"Processed {processed}/{frame_count} frames")
+            if processed % progress_interval == 0:
+                print(f"Processed {processed} frames")
     finally:
         capture.release()
         writer.release()
 
-    if processed != frame_count:
-        raise RuntimeError(f"Decoded {processed} frames, expected {frame_count}")
+    if not processed:
+        temp_video_path.unlink(missing_ok=True)
+        raise RuntimeError("No video frames could be decoded")
+    print(f"Finished decoding {processed} frames")
 
     finish_video(
         temp_video_path, args.input, args.output,

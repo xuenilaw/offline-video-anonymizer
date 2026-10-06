@@ -47,7 +47,7 @@ def main():
         result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 timeout=120)
         details = log.read_text(encoding="utf-8") if log.exists() else "No worker log was created"
-        if result.returncode or not output.is_file() or "Processed 12/12 frames" not in details:
+        if result.returncode or not output.is_file() or "Finished decoding 12 frames" not in details:
             raise RuntimeError(f"Bundled processing failed ({result.returncode}):\n{details}")
         capture = cv2.VideoCapture(str(output))
         try:

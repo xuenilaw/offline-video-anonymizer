@@ -20,6 +20,8 @@ Finished videos appear in the preview on the right. Use **‹ Previous** and **N
 
 **Processing details** shows an overall progress bar, percentage, and approximate remaining time for single videos and folders. The estimate is based on completed frames and observed processing speed; it becomes more useful after processing starts. Audio finishing can take additional time, so that stage is shown separately before the bar reaches 100%.
 
+Automatic face masking now uses a coarse mosaic even for very large faces. Dashcam footage also gets a closer detection pass over overlapping parts of each frame to catch more distant pedestrians; this can make dashcam processing slower. Small, obscured, or heavily compressed faces can still be missed, so review the result and draw cover areas where needed. MP4/MKV frame counts are treated as estimates: trimmed or no-duration videos continue until decoding reaches the real end of the file.
+
 Click **Cancel processing** to stop a single video, a folder job, or a manual reprocessing job. In a folder job, videos already completed stay available in the result preview; the current video stops and the remaining videos are skipped. The app removes temporary files from the interrupted video. You can start another job after cancellation finishes.
 
 Automatic name rectangles currently cover only the recognized two-by-two meeting layout. For other layouts, use **Draw cover / blur / keep-clear areas…** to cover the visible names. The interface runs locally; it does not upload video.

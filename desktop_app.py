@@ -1,6 +1,7 @@
 """Small offline desktop front end for the video anonymizer."""
 
 import json
+import math
 import os
 from copy import deepcopy
 from dataclasses import asdict
@@ -33,7 +34,8 @@ import cv2
 
 PROJECT_DIR = Path(__file__).resolve().parent
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
-FRAME_PROGRESS = re.compile(r"Processed (\d+)/(\d+) frames")
+FRAME_PROGRESS = re.compile(r"Processed (\d+) frames")
+FRAME_FINISHED = re.compile(r"Finished decoding (\d+) frames")
 TYPE_LABELS = {
     "Let the app suggest": "auto",
     "Online meeting": "meeting",
@@ -95,7 +97,15 @@ def unique_destination(source, output_folder, reserved):
 def video_frame_count(path):
     capture = cv2.VideoCapture(str(path))
     try:
-        return max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        reported = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        if math.isfinite(reported) and reported > 0:
+            return int(reported)
+        count = 0
+        while capture.read()[0]:
+            count += 1
+        if not count:
+            raise ValueError(f"No video frames could be decoded: {path}")
+        return count
     finally:
         capture.release()
 
@@ -585,7 +595,7 @@ class AnonymizerApp:
                     self.events.put(("error", output.strip() or "Video analysis failed."))
                 else:
                     self.events.put(("analysis", (str(source.resolve()), output)))
-            except OSError as error:
+            except (OSError, ValueError) as error:
                 self.events.put(("error", str(error)))
             finally:
                 log_path.unlink(missing_ok=True)
@@ -675,10 +685,11 @@ class AnonymizerApp:
                         if line:
                             self.events.put(("log", line))
                             match = FRAME_PROGRESS.fullmatch(line.strip())
-                            if match:
-                                processed, reported_total = map(int, match.groups())
+                            finished = FRAME_FINISHED.fullmatch(line.strip())
+                            if match or finished:
+                                processed = int((match or finished).group(1))
                                 self.events.put(("meter", estimator.snapshot(
-                                    min(processed, frame_count), finalizing=processed >= reported_total
+                                    min(processed, frame_count), finalizing=finished is not None
                                 )))
                         elif process.poll() is not None:
                             break
@@ -761,7 +772,7 @@ class AnonymizerApp:
                 self.events.put(("batch_completed", (completed, failed)))
             except ProcessingCancelled:
                 self.events.put(("cancelled", (completed, failed)))
-            except OSError as error:
+            except (OSError, ValueError) as error:
                 self.events.put(("error", str(error)))
             finally:
                 self.events.put(("done", None))

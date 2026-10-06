@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 
 import cv2
@@ -51,6 +52,32 @@ def _sample_indices(frame_count, maximum):
                    for i in range(maximum)})
 
 
+def _sample_frames(capture, frame_count, fps, maximum):
+    if frame_count > 0:
+        found = 0
+        for index in _sample_indices(frame_count, maximum):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = capture.read()
+            if ok:
+                found += 1
+                yield frame
+        if found:
+            return
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    # Some MKVs report no frame count, and some files report positions that
+    # cannot be sought. Sample sequentially until EOF or the limit.
+    stride = max(1, round(fps)) if math.isfinite(fps) and fps > 0 else 24
+    index = samples = 0
+    while samples < maximum:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        if index % stride == 0:
+            yield frame
+            samples += 1
+        index += 1
+
+
 def _dark_center_dividers(gray):
     height, width = gray.shape
     vertical = gray[int(height * 0.13) : int(height * 0.85), width // 2 - 5 : width // 2 + 5]
@@ -76,10 +103,13 @@ def analyze_video(video_path, *, face_model_path=FACE_MODEL_PATH, max_samples=7)
     if not capture.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
     try:
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        reported_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        frame_count = (int(reported_count)
+                       if math.isfinite(reported_count) and reported_count > 0 else 0)
+        fps = capture.get(cv2.CAP_PROP_FPS)
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if frame_count < 1 or width < 20 or height < 20:
+        if width < 20 or height < 20:
             raise ValueError(f"Video has no usable frames: {video_path}")
 
         face_detector = cv2.FaceDetectorYN.create(
@@ -94,11 +124,7 @@ def analyze_video(video_path, *, face_model_path=FACE_MODEL_PATH, max_samples=7)
         observations = []
         previous_small = None
         motions = []
-        for index in _sample_indices(frame_count, max_samples):
-            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, frame = capture.read()
-            if not ok:
-                continue
+        for frame in _sample_frames(capture, frame_count, fps, max_samples):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             _, raw_faces = face_detector.detect(frame)
             large_faces = 0
