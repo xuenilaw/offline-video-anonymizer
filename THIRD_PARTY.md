@@ -10,3 +10,5 @@ This file records the upstream components used by the desktop app. The build scr
 | NumPy | Required by OpenCV and the desktop preview | The installed wheel's license text is included in the app's `licenses` folder. |
 
 Installing dependencies from package indexes is different from redistributing their binaries. Do not publish these unsigned build artifacts as a public release until the exact FFmpeg binaries' corresponding source and redistribution obligations are addressed for each platform. FFmpeg's own [legal guidance](https://ffmpeg.org/legal.html) explains that GPL components can change the binary's license and recommends providing the corresponding source with distributed binaries. macOS Developer ID signing and notarization, and Windows code signing, are also still pending for a smooth first launch after download.
+
+Output MP4 encoding now uses FFmpeg's `libx264` encoder. The locally tested macOS FFmpeg binary enables `libx264`, which is GPL licensed; confirm the exact binary and its license on every release platform and satisfy the corresponding source obligations before distributing an installer.

@@ -5,9 +5,11 @@ from dataclasses import asdict
 import json
 import math
 from pathlib import Path
+import tempfile
 
 import cv2
-from audio_processing import finish_video
+from audio_processing import encode_timed_frames, finish_video
+from frame_timing import scan_frame_times
 from manual_regions import parse_timed_region, region_active
 from meeting_names import (
     is_standard_two_by_two,
@@ -94,6 +96,10 @@ def pixelate(frame, box, pad_x_ratio=0.15, pad_y_ratio=0.30):
     if region.size == 0:
         return
 
+    if box[2] < 20 or box[3] < 20:
+        region[:] = region.mean(axis=(0, 1)).astype(region.dtype)
+        return
+
     # Limit the number of blocks, not just their pixel size: a 600 px face
     # should still collapse to a coarse mosaic rather than ~40 blocks wide.
     tiny_width = min(8, max(2, (x2 - x1) // 10))
@@ -113,25 +119,29 @@ def detect_faces(frame, detector, video_type):
         candidates.extend((tuple(map(int, face[:4])), float(face[-1])) for face in raw)
 
     if video_type == "dashcam" and width >= 960 and height >= 540:
-        tile_width = round(width * 0.56)
-        tile_height = round(height * 0.56)
-        for y in (0, height - tile_height):
-            for x in (0, width - tile_width):
-                tile = frame[y:y + tile_height, x:x + tile_width]
-                enlarged = cv2.resize(tile, (width, height), interpolation=cv2.INTER_LINEAR)
-                _, small_faces = detector.detect(enlarged)
-                if small_faces is None:
-                    continue
-                for face in small_faces:
-                    if face[-1] < 0.45:
+        tile_width = round(width * 0.38)
+        tile_height = round(height * 0.38)
+        x_positions = (0, round(width * 0.31), width - tile_width)
+        y_positions = (round(height * 0.18), round(height * 0.48))
+        detector.setScoreThreshold(0.35)
+        try:
+            for y in y_positions:
+                for x in x_positions:
+                    tile = frame[y:y + tile_height, x:x + tile_width]
+                    enlarged = cv2.resize(tile, (width, height), interpolation=cv2.INTER_LINEAR)
+                    _, small_faces = detector.detect(enlarged)
+                    if small_faces is None:
                         continue
-                    box = (
-                        max(0, round(x + face[0] * tile_width / width)),
-                        max(0, round(y + face[1] * tile_height / height)),
-                        max(1, round(face[2] * tile_width / width)),
-                        max(1, round(face[3] * tile_height / height)),
-                    )
-                    candidates.append((box, float(face[-1])))
+                    for face in small_faces:
+                        box = (
+                            max(0, round(x + face[0] * tile_width / width)),
+                            max(0, round(y + face[1] * tile_height / height)),
+                            max(1, round(face[2] * tile_width / width)),
+                            max(1, round(face[3] * tile_height / height)),
+                        )
+                        candidates.append((box, float(face[-1])))
+        finally:
+            detector.setScoreThreshold(0.45)
 
     selected = []
     for box, score in sorted(candidates, key=lambda candidate: candidate[1], reverse=True):
@@ -238,6 +248,11 @@ def main(argv=None):
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     reported_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
     frame_count = int(reported_count) if math.isfinite(reported_count) and reported_count > 0 else 0
+    frame_times, variable_rate = scan_frame_times(capture, fps)
+    capture.release()
+    capture = cv2.VideoCapture(str(args.input))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not reopen input video: {args.input}")
     for region in args.name_region + args.hide_region + args.blur_region + args.keep_face_region:
         x, y = region[:2]
         if x >= width or y >= height:
@@ -265,12 +280,20 @@ def main(argv=None):
             str(FACE_MODEL_PATH), "", (width, height),
             score_threshold=0.45, nms_threshold=0.3, top_k=5000,
         )
-    writer = cv2.VideoWriter(
-        str(temp_video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-    )
-    if not writer.isOpened():
-        capture.release()
-        raise RuntimeError(f"Could not create temporary video: {temp_video_path}")
+    writer = None
+    frame_directory = None
+    if variable_rate:
+        frame_directory = tempfile.TemporaryDirectory(
+            prefix=f".{args.output.stem}_frames_", dir=args.output.parent
+        )
+        print("Variable frame rate detected; preserving frame timestamps.")
+    else:
+        writer = cv2.VideoWriter(
+            str(temp_video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
+        if not writer.isOpened():
+            capture.release()
+            raise RuntimeError(f"Could not create temporary video: {temp_video_path}")
 
     print(f"Profile: {video_type}; input: {width}x{height}, {fps:.3f} FPS, "
           f"reported frames: {frame_count or 'unknown'}")
@@ -288,6 +311,7 @@ def main(argv=None):
     face_tracks = []
     processed = 0
     progress_interval = max(1, round(fps))
+    frame_paths = []
 
     try:
         while True:
@@ -316,7 +340,7 @@ def main(argv=None):
             # Save keep-clear areas before masking faces. Later plate and manual
             # masks still cover these areas if they overlap.
             clear_patches = []
-            seconds = processed / fps
+            seconds = frame_times[processed] if processed < len(frame_times) else processed / fps
             for region in args.keep_face_region:
                 if not region_active(region, seconds):
                     continue
@@ -324,7 +348,9 @@ def main(argv=None):
                 clear_patches.append((x1, y1, x2, y2, frame[y1:y2, x1:x2].copy()))
 
             for track in face_tracks:
-                pad_x, pad_y = (0.15, 0.10) if video_type == "meeting" else (0.35, 0.40)
+                pad_x, pad_y = ((0.40, 0.45) if video_type == "meeting"
+                                else (0.70, 0.80) if video_type == "dashcam"
+                                else (0.35, 0.40))
                 pixelate(
                     frame,
                     track["box"],
@@ -345,25 +371,40 @@ def main(argv=None):
             redact_regions(frame, [region[:4] for region in args.hide_region
                                    if region_active(region, seconds)])
 
-            writer.write(frame)
+            if writer is not None:
+                writer.write(frame)
+            else:
+                frame_path = Path(frame_directory.name) / f"{processed:09d}.jpg"
+                if not cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 96]):
+                    raise OSError(f"Could not save temporary frame: {frame_path}")
+                frame_paths.append(frame_path)
             processed += 1
             if processed % progress_interval == 0:
                 print(f"Processed {processed} frames")
+        if writer is not None:
+            writer.release()
+            writer = None
+        if not processed:
+            raise RuntimeError("No video frames could be decoded")
+        print(f"Finished decoding {processed} frames")
+        if variable_rate:
+            actual_times = frame_times[:processed]
+            if len(actual_times) < processed:
+                actual_times.extend(index / fps for index in range(len(actual_times), processed))
+            encode_timed_frames(frame_paths, actual_times, temp_video_path, fps)
+        finish_video(
+            temp_video_path, args.input, args.output,
+            mode=args.audio_mode, semitones=args.pitch_semitones,
+            video_already_h264=variable_rate,
+        )
+        print(f"Created: {args.output}")
     finally:
         capture.release()
-        writer.release()
-
-    if not processed:
+        if writer is not None:
+            writer.release()
+        if frame_directory is not None:
+            frame_directory.cleanup()
         temp_video_path.unlink(missing_ok=True)
-        raise RuntimeError("No video frames could be decoded")
-    print(f"Finished decoding {processed} frames")
-
-    finish_video(
-        temp_video_path, args.input, args.output,
-        mode=args.audio_mode, semitones=args.pitch_semitones,
-    )
-
-    print(f"Created: {args.output}")
 
 
 if __name__ == "__main__":

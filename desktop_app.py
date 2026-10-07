@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -83,15 +84,30 @@ def run_worker(kind, log_path, args):
 
 def unique_destination(source, output_folder, reserved):
     """Keep every batch output separate, including across repeated runs."""
-    base = source.stem + "_anonymized"
+    return unique_file_destination(output_folder / f"{source.stem}_anonymized.mp4", reserved)
+
+
+def unique_file_destination(preferred, reserved):
+    """Add a numbered suffix when an output file already exists."""
+    preferred = Path(preferred)
     counter = 1
     while True:
         suffix = "" if counter == 1 else f"_{counter}"
-        destination = output_folder / f"{base}{suffix}.mp4"
+        destination = preferred.with_name(f"{preferred.stem}{suffix}{preferred.suffix}")
         if not destination.exists() and destination not in reserved:
             reserved.add(destination)
             return destination
         counter += 1
+
+
+def cleanup_temporary_output(destination):
+    """Remove artifacts left when a worker exits before its own cleanup."""
+    destination = Path(destination)
+    for suffix in ("_video_only.mp4", ".audio_tmp.mp4", "_video_only.frames.ffconcat"):
+        destination.with_name(f".{destination.stem}{suffix}").unlink(missing_ok=True)
+    for folder in destination.parent.glob(f".{destination.stem}_frames_*"):
+        if folder.is_dir():
+            shutil.rmtree(folder)
 
 
 def video_frame_count(path):
@@ -211,6 +227,7 @@ class AnonymizerApp:
         self.input_mode = tk.StringVar(value="video")
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
+        self.output_confirmed = False
         self.video_type = tk.StringVar(value="Let the app suggest")
         self.auto_batch = tk.BooleanVar(value=True)
         self.faces = tk.BooleanVar(value=True)
@@ -462,6 +479,7 @@ class AnonymizerApp:
         folder = self.input_mode.get() == "folder"
         self.input_path.set("")
         self.output_path.set("")
+        self.output_confirmed = False
         self.analysis = None
         self._reset_results()
         self.input_label.configure(text="Folder to anonymize" if folder else "Video to anonymize")
@@ -491,6 +509,7 @@ class AnonymizerApp:
             selected = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.mov *.mkv *.avi"), ("All files", "*")])
         if selected:
             self.input_path.set(selected)
+            self.output_confirmed = False
             self.analysis = None
             self._reset_results()
             if self.input_mode.get() == "folder":
@@ -514,6 +533,7 @@ class AnonymizerApp:
             selected = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 video", "*.mp4")])
         if selected:
             self.output_path.set(selected)
+            self.output_confirmed = True
 
     def _type_changed(self, _event=None):
         selected = TYPE_LABELS[self.video_type.get()]
@@ -592,11 +612,11 @@ class AnonymizerApp:
                                         creationflags=worker_creation_flags())
                 output = log_path.read_text(encoding="utf-8")
                 if result.returncode:
-                    self.events.put(("error", output.strip() or "Video analysis failed."))
+                    self.events.put(("analysis_error", output.strip() or "Video analysis failed."))
                 else:
                     self.events.put(("analysis", (str(source.resolve()), output)))
             except (OSError, ValueError) as error:
-                self.events.put(("error", str(error)))
+                self.events.put(("analysis_error", str(error)))
             finally:
                 log_path.unlink(missing_ok=True)
                 self.events.put(("done", None))
@@ -639,6 +659,7 @@ class AnonymizerApp:
             "folder": folder,
             "sources": sources,
             "destination": destination,
+            "output_confirmed": self.output_confirmed,
             "video_type": TYPE_LABELS[self.video_type.get()],
             "auto_batch": self.auto_batch.get(),
             "masks": (self.faces.get(), self.plates.get(), self.names.get()),
@@ -669,6 +690,7 @@ class AnonymizerApp:
     def _run_command_with_progress(self, command, estimator, frame_count):
         self._check_cancelled()
         log_path = worker_log_path()
+        returncode = None
         try:
             process = subprocess.Popen(worker_command("process", log_path, *command),
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -695,16 +717,16 @@ class AnonymizerApp:
                             break
                         else:
                             time.sleep(0.05)
-                return process.wait()
+                returncode = process.wait()
+                return returncode
             finally:
                 with self.process_lock:
                     self.active_process = None
         finally:
             log_path.unlink(missing_ok=True)
-            if self.cancel_requested.is_set():
+            if self.cancel_requested.is_set() or returncode != 0:
                 destination = Path(command[command.index("--output") + 1])
-                for suffix in ("_video_only.mp4", ".audio_tmp.mp4"):
-                    destination.with_name(f".{destination.stem}{suffix}").unlink(missing_ok=True)
+                cleanup_temporary_output(destination)
 
     def _process(self):
         try:
@@ -733,7 +755,9 @@ class AnonymizerApp:
                     self._check_cancelled()
                     frame_count = frame_counts[index - 1]
                     destination = (unique_destination(source, settings["destination"], reserved)
-                                   if settings["folder"] else settings["destination"])
+                                   if settings["folder"] else
+                                   settings["destination"] if settings["output_confirmed"] else
+                                   unique_file_destination(settings["destination"], reserved))
                     self.events.put(("progress", f"Processing {index} of {total}: {source.name}"))
                     self.events.put(("log", f"\n[{index}/{total}] {source.name}\n"))
                     self.events.put(("meter", estimator.snapshot()))
@@ -757,6 +781,8 @@ class AnonymizerApp:
                         if returncode != 0:
                             failed += 1
                             self.events.put(("log", f"Failed: {source.name}. See the error above.\n"))
+                            if not settings["folder"]:
+                                self.events.put(("processing_error", f"Could not process {source.name}. See Processing details."))
                         else:
                             completed += 1
                             self.events.put(("file_completed", (
@@ -773,7 +799,7 @@ class AnonymizerApp:
             except ProcessingCancelled:
                 self.events.put(("cancelled", (completed, failed)))
             except (OSError, ValueError) as error:
-                self.events.put(("error", str(error)))
+                self.events.put(("processing_error", str(error)))
             finally:
                 self.events.put(("done", None))
 
@@ -814,6 +840,7 @@ class AnonymizerApp:
                     self.events.put(("batch_completed", (1, 0)))
                 else:
                     self.events.put(("batch_completed", (0, 1)))
+                    self.events.put(("processing_error", f"Could not reprocess {source.name}. See Processing details."))
             except ProcessingCancelled:
                 self.events.put(("cancelled", (0, 0)))
             except (OSError, ValueError) as error:
@@ -821,6 +848,7 @@ class AnonymizerApp:
                     self.events.put(("cancelled", (0, 0)))
                     return
                 self.events.put(("log", f"Reprocessing failed: {error}\n"))
+                self.events.put(("processing_error", str(error)))
                 self.events.put(("batch_completed", (0, 1)))
             finally:
                 self.events.put(("done", None))
@@ -894,9 +922,11 @@ class AnonymizerApp:
                     self.meter_value.set(percent)
                     self.meter_percent.set(f"{percent}%")
                     self.remaining_time.set(remaining)
-                elif kind == "error":
+                elif kind == "analysis_error":
                     self.suggestion.set("Analysis failed. Check the error and choose a type manually.")
                     messagebox.showerror("Analysis failed", payload)
+                elif kind == "processing_error":
+                    messagebox.showerror("Processing failed", payload)
                 elif kind == "file_completed":
                     destination, source, settings, video_type, masks, focus = payload
                     self.results.append(destination)

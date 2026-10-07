@@ -6,6 +6,7 @@ from tkinter import messagebox, ttk
 
 import cv2
 
+from frame_timing import scan_frame_times
 from manual_regions import region_active
 
 
@@ -35,13 +36,16 @@ class RegionEditor(tk.Toplevel):
             raise ValueError(f"Could not open source video: {source}")
         self.width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.frame_count = int(self.capture.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = self.capture.get(cv2.CAP_PROP_FPS) or 24.0
-        if self.width < 1 or self.height < 1 or self.frame_count < 1:
+        self.frame_times, _ = scan_frame_times(self.capture, self.fps)
+        self.capture.release()
+        self.capture = cv2.VideoCapture(str(source))
+        self.frame_count = len(self.frame_times)
+        if self.width < 1 or self.height < 1 or self.frame_count < 1 or not self.capture.isOpened():
             self.capture.release()
             self.destroy()
             raise ValueError(f"Source video has no usable frames: {source}")
-        self.duration = self.frame_count / self.fps
+        self.duration = self.frame_times[-1] + 1 / self.fps
         existing = existing or {}
         self.regions = ([ ("hide", self._with_time(box)) for box in existing.get("hide", []) ]
                         + [ ("blur", self._with_time(box)) for box in existing.get("blur", []) ]
@@ -129,10 +133,12 @@ class RegionEditor(tk.Toplevel):
         return start, min(end, self.duration)
 
     def _set_start(self):
-        self.start_seconds.set(f"{round(self.slider.get()) / self.fps:.3f}")
+        self.start_seconds.set(f"{self.frame_times[round(self.slider.get())]:.3f}")
 
     def _set_end(self):
-        self.end_seconds.set(f"{min(self.duration, (round(self.slider.get()) + 1) / self.fps):.3f}")
+        next_index = round(self.slider.get()) + 1
+        end = self.frame_times[next_index] if next_index < self.frame_count else self.duration
+        self.end_seconds.set(f"{end:.3f}")
 
     def _full_duration(self):
         self.start_seconds.set("0.000")
@@ -155,7 +161,7 @@ class RegionEditor(tk.Toplevel):
         self.image = tk.PhotoImage(data=base64.b64encode(encoded.tobytes()).decode("ascii"))
         self.canvas.delete("all")
         self.canvas.create_image(*self.offset, image=self.image, anchor="nw")
-        seconds = index / self.fps
+        seconds = self.frame_times[index]
         for kind, region in self.regions:
             if not region_active(region, seconds):
                 continue
